@@ -1,9 +1,9 @@
-import {people, minimumCoverage, iso, parseDate, addBusinessDays, addDays, businessDays, sampleRequests, remaining, coverageFor, validateRequest} from './logic.mjs';
+import {people, minimumCoverage, iso, parseDate, addBusinessDays, addDays, businessDays, setTeam, remaining, coverageFor, validateRequest} from './logic.mjs';
 
-const storageKey = 'team-leave-demo-v1';
-let requests;
-try { requests = JSON.parse(localStorage.getItem(storageKey)); if (!Array.isArray(requests)) throw Error(); }
-catch { requests = sampleRequests(); }
+let requests = [];
+let me = null;
+let loading = true;
+let loadError = '';
 let role = 'employee', view = 'overview', modal = null;
 let month = new Date(new Date().getFullYear(),new Date().getMonth(),1);
 let selectedDay = iso(new Date());
@@ -14,7 +14,10 @@ const pretty = s => parseDate(s).toLocaleDateString('en-CA',{month:'short',day:'
 const longDate = s => parseDate(s).toLocaleDateString('en-CA',{weekday:'long',month:'long',day:'numeric'});
 const range = r => `${pretty(r.start)}${r.start===r.end?'':` – ${pretty(r.end)}`}`;
 const daysLabel = n => `${n} ${n===1?'day':'days'}`;
-const save = () => localStorage.setItem(storageKey,JSON.stringify(requests));
+const save = async (path, data) => { const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});const payload=await response.json();if(!response.ok)throw Error(payload.error||'Unable to save.');hydrate(payload); };
+function hydrate(data) { setTeam(data.people,data.minimumCoverage); requests=data.requests;me=data.me;role=data.role; }
+async function load() { try { const response=await fetch('/api/state');const data=await response.json();if(!response.ok)throw Error(data.error);hydrate(data);loading=false;render(); } catch(e) { loading=false;loadError=e.message;render(); } }
+const mine = () => people.find(p=>p.id===me) || people[0];
 const avatar = (p,small=false) => `<span class="avatar ${small?'small':''}" style="--avatar:${p.color}">${p.initials}</span>`;
 const badge = status => `<span class="badge ${status}"><i></i>${status[0].toUpperCase()+status.slice(1)}</span>`;
 const icon = name => ({overview:'◫',requests:'▤',calendar:'▦'}[name]);
@@ -26,20 +29,20 @@ function shell(content) {
     <aside class="sidebar"><div class="brand"><span class="brandmark"><b></b><b></b><b></b><b></b></span><span>team<span class="brandlight">leave</span></span></div>
       <div class="navlabel">WORKSPACE</div><nav aria-label="Main navigation">
       ${['overview','requests','calendar'].map(v=>`<button class="navitem ${view===v?'active':''}" data-view="${v}" ${view===v?'aria-current="page"':''}><span class="navicon">${icon(v)}</span>${v==='calendar'?'Team calendar':v[0].toUpperCase()+v.slice(1)}${v==='requests'&&role==='manager'?`<span class="navcount">${requests.filter(r=>r.status==='pending').length}</span>`:''}</button>`).join('')}
-      </nav><div class="sidebottom"><div class="sidecaption">DEMO WORKSPACE</div><p>Explore the workflow with sample people and balances. Changes stay in this browser.</p><button class="textbtn" data-action="reset">Reset sample data ↗</button></div>
-    </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view==='calendar'?'Team calendar':view[0].toUpperCase()+view.slice(1)}</div><div class="toptools"><span class="private"><span class="lock">●</span> Owner private</span><div class="roles" aria-label="Demo role"><button class="${role==='employee'?'selected':''}" data-role="employee">Employee</button><button class="${role==='manager'?'selected':''}" data-role="manager">Manager</button></div>${avatar(people[0],true)}</div></header>
+      </nav><div class="sidebottom"><button class="textbtn" data-action="team">Team members</button></div>
+    </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view==='calendar'?'Team calendar':view[0].toUpperCase()+view.slice(1)}</div><div class="toptools"><span class="private"><span class="lock">●</span> Owner private</span><span class="private">${escapeHtml(mine()?.name||'Team member')} · ${role}</span>${mine()?avatar(mine(),true):''}</div></header>
     <main class="main">${content}</main></div></div>${modal?renderModal():''}<div id="toast" role="status" aria-live="polite"></div>`;
 }
 
 function overview() {
-  const balance = remaining('alex',requests);
+  const balance = remaining(me,requests);
   const pending = requests.filter(r=>r.status==='pending');
   const soon = requests.filter(r=>r.status==='approved' && r.end>=iso(new Date())).sort((a,b)=>a.start.localeCompare(b.start)).slice(0,4);
   const risks = pending.map(r=>({r,days:riskFor(r)})).filter(x=>x.days.length);
   const awayNow = new Set(requests.filter(r=>r.status==='approved' && r.start<=iso(new Date()) && r.end>=iso(new Date())).map(r=>r.person)).size;
   return `<div class="pageheading"><div><div class="eyebrow">${role==='manager'?'TEAM OVERVIEW':'YOUR TIME OFF'}</div><h1>${role==='manager'?'A clearer view of time away.':'Make room for time away.'}</h1><p>${role==='manager'?'Review requests, protect coverage, and keep everyone in the loop.':'Your leave balance, requests, and team plans in one place.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
   <section class="hero"><div class="herotext"><span class="heroeyebrow">${role==='manager'?'TEAM LEAVE / '+new Date().getFullYear():'YOUR LEAVE / '+new Date().getFullYear()}</span><h2>${role==='manager'?'Plan together.<br>Stay covered.':'Time off looks<br>good on you.'}</h2><p>${role==='manager'?'The team’s next decisions and availability, at a glance.':'You have '+balance.available+' days available to plan this year.'}</p><button class="whitebutton" data-action="${role==='manager'?'queue':'new'}">${role==='manager'?'Review requests':'Plan time off'} <span>↗</span></button></div><div class="heroart"><div class="artcircle one"></div><div class="artcircle two"></div><div class="artcard"><div class="artrow"><span class="artsun">✳</span><span>TIME TO RESET</span></div><div class="artdays">${role==='manager'?pending.length:balance.available}<span>${role==='manager'?'to review':'days left'}</span></div><div class="artline"><span></span><span></span><span></span></div></div></div></section>
-  <section class="stats" aria-label="At a glance"><div class="stat"><div class="stathead"><span>Available to use</span><span class="statglyph lavender">✳</span></div><strong>${balance.available}<small> days</small></strong><div class="statfoot">Your ${new Date().getFullYear()} vacation balance</div></div><div class="stat"><div class="stathead"><span>${role==='manager'?'Awaiting your review':'Your pending requests'}</span><span class="statglyph peach">◷</span></div><strong>${role==='manager'?pending.length:pending.filter(r=>r.person==='alex').length}<small> requests</small></strong><div class="statfoot">${role==='manager'?'Decision needed':'Waiting for manager approval'}</div></div><div class="stat"><div class="stathead"><span>Team away today</span><span class="statglyph mint">◉</span></div><strong>${awayNow}<small> people</small></strong><div class="statfoot">${people.length-awayNow} of ${people.length} available</div></div></section>
+  <section class="stats" aria-label="At a glance"><div class="stat"><div class="stathead"><span>Available to use</span><span class="statglyph lavender">✳</span></div><strong>${balance.available}<small> days</small></strong><div class="statfoot">Your ${new Date().getFullYear()} vacation balance</div></div><div class="stat"><div class="stathead"><span>${role==='manager'?'Awaiting your review':'Your pending requests'}</span><span class="statglyph peach">◷</span></div><strong>${role==='manager'?pending.length:pending.filter(r=>r.person===me).length}<small> requests</small></strong><div class="statfoot">${role==='manager'?'Decision needed':'Waiting for manager approval'}</div></div><div class="stat"><div class="stathead"><span>Team away today</span><span class="statglyph mint">◉</span></div><strong>${awayNow}<small> people</small></strong><div class="statfoot">${people.length-awayNow} of ${people.length} available</div></div></section>
   <div class="overviewgrid"><section class="panel"><div class="sectionhead"><div><span class="eyebrow">COMING UP</span><h3>Upcoming absences</h3></div><button class="linkbutton" data-view="calendar">View calendar <span>→</span></button></div>${soon.length?`<div class="absence-list">${soon.map(r=>`<div class="absence">${avatar(person(r.person))}<div class="absenceperson"><b>${person(r.person).name}</b><span>Vacation · ${daysLabel(businessDays(r.start,r.end))}</span></div><time>${range(r)}</time></div>`).join('')}</div>`:'<div class="empty">No upcoming approved time off yet.</div>'}</section>
   <section class="panel coveragepanel"><div class="sectionhead"><div><span class="eyebrow">COVERAGE WATCH</span><h3>Needs a closer look</h3></div><span class="countpill">${risks.length} ${risks.length===1?'conflict':'conflicts'}</span></div>${risks.length?risks.slice(0,2).map(({r,days})=>`<div class="riskitem"><span class="riskicon">!</span><div><b>${person(r.person).name} · ${range(r)}</b><p>${daysLabel(days.length)} below ${minimumCoverage}-person minimum if approved. ${days[0].available} available on ${pretty(days[0].date)}.</p><button class="smalllink" data-review="${r.id}">Review request →</button></div></div>`).join(''):'<div class="goodstate"><span>✓</span><div><b>Coverage looks healthy</b><p>No pending requests currently fall below your team minimum.</p></div></div>'}<div class="coveragefoot">Based on approved leave · minimum ${minimumCoverage} of ${people.length} available</div></section></div>`;
 }
@@ -52,9 +55,9 @@ function requestRows(items, manager) {
   }).join('')}</tbody></table></div>`;
 }
 function requestsPage() {
-  const list = role==='manager'?[...requests].sort(requestOrder):requests.filter(r=>r.person==='alex').sort(requestOrder);
+  const list = role==='manager'?[...requests].sort(requestOrder):requests.filter(r=>r.person===me).sort(requestOrder);
   const pending = list.filter(r=>r.status==='pending').length;
-  const b = remaining('alex',requests);
+  const b = remaining(me,requests);
   return `<div class="pageheading"><div><div class="eyebrow">${role==='manager'?'APPROVALS':'MY REQUESTS'}</div><h1>${role==='manager'?'Requests & decisions':'Your requests'}</h1><p>${role==='manager'?'Make decisions with leave balances and coverage in view.':'Submit time off and follow each request through to a decision.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
   ${role==='employee'?`<section class="balancebar"><div><span class="eyebrow">${new Date().getFullYear()} BALANCE</span><strong>${b.available} <small>days available</small></strong></div><div class="balanceitems"><span><b>${b.allowance}</b> annual</span><span><b>${b.used}</b> used</span><span><b>${b.approved}</b> approved ahead</span><span><b>${b.pending}</b> awaiting approval</span></div></section>`:`<div class="queueintro"><span class="queueicon">◷</span><div><b>${pending} ${pending===1?'request needs':'requests need'} a decision</b><span>Coverage warnings are based on approved leave and a ${minimumCoverage}-person minimum.</span></div></div>`}
   <section class="panel requestspanel"><div class="sectionhead"><div><span class="eyebrow">${role==='manager'?'TEAM':'HISTORY'}</span><h3>${role==='manager'?'All team requests':'All your requests'}</h3></div><span class="countpill">${list.length} total</span></div>${requestRows(list,role==='manager')}</section>`;
@@ -77,9 +80,10 @@ function calendarPage() {
 }
 
 function renderModal() {
+  if (modal.kind==='team') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><h2 id="dialog-title">Team members</h2>${people.map(p=>`<div class="absence"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email)} · ${p.allowance} annual days</span></div>`).join('')}${role==='manager'?`<form id="teamform"><label>Name<input name="name" required></label><label>Email<input name="email" type="email" required></label><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><button class="primary" type="submit">Add team member</button></form>`:''}</div></div>`;
   if (modal.kind==='new') {
     const start=iso(addBusinessDays(new Date(),7)), end=iso(addBusinessDays(new Date(),8));
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW REQUEST</div><h2 id="dialog-title">Request time off</h2><p class="dialoglead">Plan your dates. Your manager will see any coverage concerns before deciding.</p><form id="requestform"><label>Employee<select name="person" ${role==='employee'?'disabled':''}>${people.map(p=>`<option value="${p.id}" ${p.id==='alex'?'selected':''}>${p.name}</option>`).join('')}</select></label><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage"></textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">Submit request →</button></div></form></div></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW REQUEST</div><h2 id="dialog-title">Request time off</h2><p class="dialoglead">Plan your dates. Your manager will see any coverage concerns before deciding.</p><form id="requestform"><label>Employee<select name="person" ${role==='employee'?'disabled':''}>${people.map(p=>`<option value="${p.id}" ${p.id===me?'selected':''}>${escapeHtml(p.name)}</option>`).join('')}</select></label><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage"></textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">Submit request →</button></div></form></div></div>`;
   }
   const r=requests.find(x=>x.id===modal.id); if(!r) return '';
   const risk=riskFor(r), b=remaining(r.person,requests);
@@ -87,6 +91,8 @@ function renderModal() {
 }
 
 function render() {
+  if(loading){app.innerHTML='<main class="main"><h1>Loading team leave…</h1></main>';return;}
+  if(loadError){app.innerHTML=`<main class="main"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" onclick="location.reload()">Try again</button></main>`;return;}
   app.innerHTML=shell(view==='overview'?overview():view==='requests'?requestsPage():calendarPage());
   if (modal?.kind==='new') updatePreview();
   if(modal) document.querySelector('.dialogclose')?.focus();
@@ -99,28 +105,28 @@ function updatePreview() {
 }
 function toast(message) { const el=document.getElementById('toast'); if(!el)return; el.textContent=message; el.classList.add('visible'); setTimeout(()=>el.classList.remove('visible'),3500); }
 function setError(message) { const el=document.getElementById('formerror'); if(el)el.textContent=message; }
-app.addEventListener('click',e=>{
+app.addEventListener('click',async e=>{
   const nav=e.target.closest('[data-view]'); if(nav){view=nav.dataset.view;modal=null;render();return;}
-  const switcher=e.target.closest('[data-role]'); if(switcher){role=switcher.dataset.role;modal=null;view='overview';render();return;}
+
   const review=e.target.closest('[data-review]'); if(review){role='manager';modal={kind:'review',id:review.dataset.review};render();return;}
-  const cancel=e.target.closest('[data-cancel]'); if(cancel){const r=requests.find(x=>x.id===cancel.dataset.cancel);if(r?.person==='alex'&&r.status==='pending'){r.status='cancelled';save();render();toast('Request cancelled. Your balance is unchanged.');}return;}
+  const cancel=e.target.closest('[data-cancel]'); if(cancel){const r=requests.find(x=>x.id===cancel.dataset.cancel);if(r?.person===me&&r.status==='pending'){try{await save('/api/requests/'+encodeURIComponent(r.id)+'/cancel',{});render();toast('Request cancelled.');}catch(err){toast(err.message)}}return;}
   const date=e.target.closest('[data-date]'); if(date){selectedDay=date.dataset.date;month=new Date(parseDate(selectedDay).getFullYear(),parseDate(selectedDay).getMonth(),1);render();return;}
   const button=e.target.closest('[data-action]'); if(!button)return;
   if(button.dataset.action==='close'){if(e.target===button || button.tagName==='BUTTON'){modal=null;render();}return;}
   if(button.dataset.action==='new'){modal={kind:'new'};render();return;}
   if(button.dataset.action==='queue'){view='requests';render();return;}
-  if(button.dataset.action==='reset'){requests=sampleRequests();save();role='employee';view='overview';modal=null;render();toast('Sample workspace reset.');return;}
+  if(button.dataset.action==='team'){modal={kind:'team'};render();return;}
   if(button.dataset.action==='prevmonth'||button.dataset.action==='nextmonth'){month=new Date(month.getFullYear(),month.getMonth()+(button.dataset.action==='prevmonth'?-1:1),1);selectedDay=iso(month);render();return;}
   if(button.dataset.action==='today'){month=new Date(new Date().getFullYear(),new Date().getMonth(),1);selectedDay=iso(new Date());render();}
 });
 app.addEventListener('input',e=>{if(e.target.closest('#requestform')){updatePreview();setError('');}});
 app.addEventListener('change',e=>{if(e.target.closest('#requestform'))updatePreview();});
-app.addEventListener('submit',e=>{
+app.addEventListener('submit',async e=>{
+  if(e.target.id==='teamform'){e.preventDefault();const f=e.target;try{await save('/api/people',{name:f.elements.name.value,email:f.elements.email.value,allowance:Number(f.elements.allowance.value)});modal=null;render();toast('Team member added. Invite this email to the private Site to grant access.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='requestform'){
     e.preventDefault();const f=e.target, personId=f.elements.person.value,start=f.elements.start.value,end=f.elements.end.value;
     const error=validateRequest({person:personId,start,end},requests);if(error){setError(error);return;}
-    requests.unshift({id:'r'+Date.now(),person:personId,start,end,type:'Vacation',status:'pending',note:f.elements.note.value.trim(),decisionNote:'',submitted:iso(new Date())});
-    save();modal=null;view='requests';render();toast('Request submitted for manager review.');return;
+    try { await save('/api/requests',{person:personId,start,end,note:f.elements.note.value.trim()});modal=null;view='requests';render();toast('Request submitted for manager review.'); } catch(err){setError(err.message)}return;
   }
   if(e.target.id==='decisionform'){
     e.preventDefault();const f=e.target,decision=e.submitter?.value, r=requests.find(x=>x.id===modal.id),note=f.elements.decisionNote.value.trim();
@@ -128,8 +134,8 @@ app.addEventListener('submit',e=>{
     if(decision==='declined'&&!note){setError('Add a short reason before declining.');return;}
     if(decision==='approved'&&riskFor(r).length&&!f.elements.override?.checked){setError('Confirm that coverage is arranged before approving this conflict.');return;}
     if(decision==='approved'&&businessDays(r.start,r.end)>remaining(r.person,requests).available){setError('This employee no longer has enough available days.');return;}
-    r.status=decision;r.decisionNote=note;r.decided=iso(new Date());save();modal=null;render();toast(`Request ${decision}.`);
+    try{await save('/api/requests/'+encodeURIComponent(r.id)+'/decision',{decision,note,override:!!f.elements.override?.checked});modal=null;render();toast(`Request ${decision}.`)}catch(err){setError(err.message)}
   }
 });
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&modal){modal=null;render();}});
-render();
+load();

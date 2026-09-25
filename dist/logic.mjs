@@ -1,11 +1,6 @@
-export const people = [
-  { id: 'alex', name: 'Alex Morgan', initials: 'AM', color: '#e4d5fa', used: 8, allowance: 25 },
-  { id: 'maya', name: 'Maya Chen', initials: 'MC', color: '#ccece4', used: 10, allowance: 25 },
-  { id: 'noah', name: 'Noah Patel', initials: 'NP', color: '#f9e5c5', used: 7, allowance: 25 },
-  { id: 'priya', name: 'Priya Shah', initials: 'PS', color: '#f9dce5', used: 12, allowance: 25 },
-  { id: 'oliver', name: 'Oliver Brooks', initials: 'OB', color: '#d6e3ff', used: 5, allowance: 25 }
-];
-export const minimumCoverage = 3;
+export const people = [];
+export let minimumCoverage = 1;
+export function setTeam(list, minimum) { people.splice(0,people.length,...list.map(p=>({...p,initials:p.name.split(' ').map(x=>x[0]).slice(0,2).join('').toUpperCase(),color:'#d6e3ff'}))); minimumCoverage=minimum; }
 export const iso = d => `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,'0')}-${String(d.getDate()).padStart(2,'0')}`;
 export const parseDate = s => new Date(`${s}T12:00:00`);
 export const addDays = (date, n) => { const d = new Date(date); d.setDate(d.getDate()+n); return d; };
@@ -37,6 +32,7 @@ export function sampleRequests(today = new Date()) {
 }
 export function remaining(personId, requests) {
   const person = people.find(p=>p.id===personId);
+  if (!person) return {allowance:0,used:0,approved:0,pending:0,available:0};
   const currentYear = new Date().getFullYear();
   const approved = requests.filter(r=>r.person===personId && r.status==='approved' && +r.start.slice(0,4)===currentYear).reduce((n,r)=>n+businessDays(r.start,r.end),0);
   const pending = requests.filter(r=>r.person===personId && r.status==='pending' && +r.start.slice(0,4)===currentYear).reduce((n,r)=>n+businessDays(r.start,r.end),0);
