@@ -20,7 +20,7 @@ async function load() { try { const response=await fetch('/api/state');const dat
 const mine = () => people.find(p=>p.id===me) || people[0];
 const avatar = (p,small=false) => `<span class="avatar ${small?'small':''}" style="--avatar:${p.color}">${p.initials}</span>`;
 const badge = status => `<span class="badge ${status}"><i></i>${status[0].toUpperCase()+status.slice(1)}</span>`;
-const icon = name => ({overview:'◫',requests:'▤',calendar:'▦'}[name]);
+const icon = name => ({overview:'◫',requests:'▤',calendar:'▦',users:'♙'}[name]);
 const riskFor = r => coverageFor(r.start,r.end,requests,r.person,r.id).filter(d=>d.conflict);
 const requestOrder = (a,b) => (a.status==='pending'?0:1)-(b.status==='pending'?0:1) || a.start.localeCompare(b.start);
 
@@ -28,9 +28,9 @@ function shell(content) {
   return `<div class="shell">
     <aside class="sidebar"><div class="brand"><span class="brandmark"><b></b><b></b><b></b><b></b></span><span>team<span class="brandlight">leave</span></span></div>
       <div class="navlabel">WORKSPACE</div><nav aria-label="Main navigation">
-      ${['overview','requests','calendar'].map(v=>`<button class="navitem ${view===v?'active':''}" data-view="${v}" ${view===v?'aria-current="page"':''}><span class="navicon">${icon(v)}</span>${v==='calendar'?'Team calendar':v[0].toUpperCase()+v.slice(1)}${v==='requests'&&role==='manager'?`<span class="navcount">${requests.filter(r=>r.status==='pending').length}</span>`:''}</button>`).join('')}
-      </nav><div class="sidebottom"><button class="textbtn" data-action="team">Team members</button></div>
-    </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view==='calendar'?'Team calendar':view[0].toUpperCase()+view.slice(1)}</div><div class="toptools"><span class="private"><span class="lock">●</span> Private team</span><span class="private">${escapeHtml(mine()?.name||'Team member')} · ${role}</span>${mine()?avatar(mine(),true):''}</div></header>
+      ${['overview','requests','calendar','users'].map(v=>`<button class="navitem ${view===v?'active':''}" data-view="${v}" ${view===v?'aria-current="page"':''}><span class="navicon">${icon(v)}</span>${v==='calendar'?'Team calendar':v==='users'?'Users':v[0].toUpperCase()+v.slice(1)}${v==='requests'&&role==='manager'?`<span class="navcount">${requests.filter(r=>r.status==='pending').length}</span>`:''}</button>`).join('')}
+      </nav><div class="sidebottom"><a class="textbtn" href="/signout-with-chatgpt?return_to=%2Flogin" target="_top">Sign out</a></div>
+    </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view==='calendar'?'Team calendar':view==='users'?'Users':view[0].toUpperCase()+view.slice(1)}</div><div class="toptools"><span class="private"><span class="lock">●</span> Private team</span><span class="private">${escapeHtml(mine()?.name||'Team member')} · ${role}</span>${mine()?avatar(mine(),true):''}</div></header>
     <main class="main">${content}</main></div></div>${modal?renderModal():''}<div id="toast" role="status" aria-live="polite"></div>`;
 }
 
@@ -79,8 +79,20 @@ function calendarPage() {
   <aside class="panel daypanel"><span class="eyebrow">DAILY SNAPSHOT</span><h3>${longDate(selectedDay)}</h3><div class="coveragefigure"><strong>${availability?availability.available:people.length}<small> / ${people.length}</small></strong><span>available to work</span></div><div class="meter"><span style="width:${(availability?availability.available:people.length)/people.length*100}%"></span></div><p class="threshold ${availability?.conflict?'at-risk':''}">${availability?.conflict?'⚠ Below coverage minimum':`✓ Minimum ${minimumCoverage} people covered`}</p><div class="daydivider"></div><h4>Away that day <span>${chosen.length}</span></h4>${chosen.length?chosen.map(r=>`<div class="dayperson">${avatar(person(r.person),true)}<div><b>${person(r.person).name}</b><span>Vacation · ${range(r)}</span></div></div>`).join(''):'<p class="quiet">Nobody is away on approved leave.</p>'}${pendingOnDay.length?`<h4 class="pendingtitle">Pending <span>${pendingOnDay.length}</span></h4>${pendingOnDay.map(r=>`<div class="dayperson">${avatar(person(r.person),true)}<div><b>${person(r.person).name}</b><span>Awaiting approval</span></div></div>`).join('')}`:''}</aside></div>`;
 }
 
+function usersPage() {
+  const minePerson=mine();
+  return `<div class="pageheading"><div><div class="eyebrow">ACCOUNT & ACCESS</div><h1>${role==='manager'?'Team users':'Your account'}</h1><p>${role==='manager'?'Manage team roles and leave balances.':'Your profile and leave balance.'}</p></div>${role==='manager'?'<button class="primary topaction" data-action="adduser">+ Add user</button>':''}</div>
+  <section class="panel userspanel"><div class="sectionhead"><div><span class="eyebrow">${role==='manager'?'TEAM DIRECTORY':'PROFILE'}</span><h3>${role==='manager'?`${people.length} users`:'Your details'}</h3></div></div>
+  <div class="userlist">${(role==='manager'?people:[minePerson]).map(p=>`<div class="userrow">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email||'')}</span></div><span class="userrole">${p.role==='manager'?'Manager':'Employee'}</span><span class="userbalance"><b>${remaining(p.id,requests).available}</b> days available</span>${role==='manager'?`<button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button>`:''}</div>`).join('')}</div></section>
+  ${role==='manager'?'<p class="userhint">Adding a user creates their team profile. Grant the same email access in the private site sharing settings before they can sign in.</p>':'<p class="userhint">Your manager can update your allowance or role. Use Sign out when you finish.</p>'}`;
+}
+
 function renderModal() {
-  if (modal.kind==='team') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><h2 id="dialog-title">Team members</h2>${people.map(p=>`<div class="absence"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email)} · ${p.allowance} annual days</span></div>`).join('')}${role==='manager'?`<form id="teamform"><label>Name<input name="name" required></label><label>Email<input name="email" type="email" required></label><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><button class="primary" type="submit">Add team member</button></form>`:''}</div></div>`;
+  if (modal.kind==='edituser') {
+    const p=person(modal.id);if(!p)return '';
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">${escapeHtml(p.email)}</p><form id="edituserform"><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Days already used<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role==='employee'?'selected':''}>Employee</option><option value="manager" ${p.role==='manager'?'selected':''}>Manager</option></select></label><p class="quiet">Changing the balance affects future request checks. Approved requests are counted separately.</p><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
+  }
+  if (modal.kind==='adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create a team profile for an invited colleague.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add user</button></div></form></div></div>`;
   if (modal.kind==='new') {
     const start=iso(addBusinessDays(new Date(),7)), end=iso(addBusinessDays(new Date(),8));
     return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW REQUEST</div><h2 id="dialog-title">Request time off</h2><p class="dialoglead">Plan your dates. Your manager will see any coverage concerns before deciding.</p><form id="requestform"><label>Employee<select name="person" ${role==='employee'?'disabled':''}>${people.map(p=>`<option value="${p.id}" ${p.id===me?'selected':''}>${escapeHtml(p.name)}</option>`).join('')}</select></label><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage"></textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">Submit request →</button></div></form></div></div>`;
@@ -92,8 +104,8 @@ function renderModal() {
 
 function render() {
   if(loading){app.innerHTML='<main class="main"><h1>Loading team leave…</h1></main>';return;}
-  if(loadError){app.innerHTML=`<main class="main"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" onclick="location.reload()">Try again</button></main>`;return;}
-  app.innerHTML=shell(view==='overview'?overview():view==='requests'?requestsPage():calendarPage());
+  if(loadError){app.innerHTML=`<main class="main"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><a href="/login">Go to sign in</a></main>`;return;}
+  app.innerHTML=shell(view==='overview'?overview():view==='requests'?requestsPage():view==='users'?usersPage():calendarPage());
   if (modal?.kind==='new') updatePreview();
   if(modal) document.querySelector('.dialogclose')?.focus();
 }
@@ -108,6 +120,7 @@ function setError(message) { const el=document.getElementById('formerror'); if(e
 app.addEventListener('click',async e=>{
   const nav=e.target.closest('[data-view]'); if(nav){view=nav.dataset.view;modal=null;render();return;}
 
+  const edit=e.target.closest('[data-edituser]');if(edit&&role==='manager'){modal={kind:'edituser',id:edit.dataset.edituser};render();return;}
   const review=e.target.closest('[data-review]'); if(review){if(role!=='manager')return;modal={kind:'review',id:review.dataset.review};render();return;}
   const cancel=e.target.closest('[data-cancel]'); if(cancel){const r=requests.find(x=>x.id===cancel.dataset.cancel);if(r?.person===me&&r.status==='pending'){try{await save('/api/requests/'+encodeURIComponent(r.id)+'/cancel',{});render();toast('Request cancelled.');}catch(err){toast(err.message)}}return;}
   const date=e.target.closest('[data-date]'); if(date){selectedDay=date.dataset.date;month=new Date(parseDate(selectedDay).getFullYear(),parseDate(selectedDay).getMonth(),1);render();return;}
@@ -115,13 +128,14 @@ app.addEventListener('click',async e=>{
   if(button.dataset.action==='close'){if(e.target===button || button.tagName==='BUTTON'){modal=null;render();}return;}
   if(button.dataset.action==='new'){modal={kind:'new'};render();return;}
   if(button.dataset.action==='queue'){view='requests';render();return;}
-  if(button.dataset.action==='team'){modal={kind:'team'};render();return;}
+  if(button.dataset.action==='adduser'&&role==='manager'){modal={kind:'adduser'};render();return;}
   if(button.dataset.action==='prevmonth'||button.dataset.action==='nextmonth'){month=new Date(month.getFullYear(),month.getMonth()+(button.dataset.action==='prevmonth'?-1:1),1);selectedDay=iso(month);render();return;}
   if(button.dataset.action==='today'){month=new Date(new Date().getFullYear(),new Date().getMonth(),1);selectedDay=iso(new Date());render();}
 });
 app.addEventListener('input',e=>{if(e.target.closest('#requestform')){updatePreview();setError('');}});
 app.addEventListener('change',e=>{if(e.target.closest('#requestform'))updatePreview();});
 app.addEventListener('submit',async e=>{
+  if(e.target.id==='edituserform'){e.preventDefault();const f=e.target;try{await save('/api/people/'+encodeURIComponent(modal.id),{name:f.elements.name.value,allowance:Number(f.elements.allowance.value),used:Number(f.elements.used.value),role:f.elements.role.value});modal=null;render();toast('User updated.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='teamform'){e.preventDefault();const f=e.target;try{await save('/api/people',{name:f.elements.name.value,email:f.elements.email.value,allowance:Number(f.elements.allowance.value)});modal=null;render();toast('Team member added. Invite this email to the private Site to grant access.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='requestform'){
     e.preventDefault();const f=e.target, personId=f.elements.person.value,start=f.elements.start.value,end=f.elements.end.value;
