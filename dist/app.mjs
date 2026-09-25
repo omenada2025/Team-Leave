@@ -1,9 +1,15 @@
 import {people, minimumCoverage, iso, parseDate, addBusinessDays, addDays, businessDays, setTeam, remaining, coverageFor, validateRequest} from './logic.mjs';
+import {createClient} from 'https://esm.sh/@supabase/supabase-js@2';
+
+const SUPABASE_URL = 'https://skezxxnhsvdrwrdxabje.supabase.co';
+const SUPABASE_KEY = 'sb_publishable_9t-QgYU94nmDlBy696rKcQ_Z0IkqiqA';
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {auth:{persistSession:true,detectSessionInUrl:true}});
 
 let requests = [];
 let me = null;
 let loading = true;
 let loadError = '';
+let session = null;
 let role = 'employee', view = 'overview', modal = null;
 let month = new Date(new Date().getFullYear(),new Date().getMonth(),1);
 let selectedDay = iso(new Date());
@@ -14,9 +20,27 @@ const pretty = s => parseDate(s).toLocaleDateString('en-CA',{month:'short',day:'
 const longDate = s => parseDate(s).toLocaleDateString('en-CA',{weekday:'long',month:'long',day:'numeric'});
 const range = r => `${pretty(r.start)}${r.start===r.end?'':` – ${pretty(r.end)}`}`;
 const daysLabel = n => `${n} ${n===1?'day':'days'}`;
-const save = async (path, data) => { const response=await fetch(path,{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify(data)});const payload=await response.json();if(!response.ok)throw Error(payload.error||'Unable to save.');hydrate(payload); };
+const rpcFor = (path,data) => {
+  if(path==='/api/people') return ['upsert_profile',{p_email:data.email,p_name:data.name,p_allowance:data.allowance,p_used:0,p_role:'employee'}];
+  const personEdit=path.match(/^\/api\/people\/([^/]+)$/); if(personEdit)return ['upsert_profile',{p_id:personEdit[1],p_name:data.name,p_allowance:data.allowance,p_used:data.used,p_role:data.role}];
+  if(path==='/api/requests')return ['submit_leave',{p_person:data.person,p_start:data.start,p_end:data.end,p_note:data.note||''}];
+  const decision=path.match(/^\/api\/requests\/([^/]+)\/decision$/);if(decision)return ['decide_leave',{p_request:decision[1],p_decision:data.decision,p_note:data.note||'',p_override:!!data.override}];
+  const cancel=path.match(/^\/api\/requests\/([^/]+)\/cancel$/);if(cancel)return ['cancel_leave',{p_request:cancel[1]}];
+  throw Error('Unsupported action.');
+};
+const save = async (path, data) => { const [fn,args]=rpcFor(path,data);const {error}=await supabase.rpc(fn,args);if(error)throw Error(error.message);await loadState(); };
 function hydrate(data) { setTeam(data.people,data.minimumCoverage); requests=data.requests;me=data.me;role=data.role; }
-async function load() { try { const response=await fetch('/api/state');const data=await response.json();if(!response.ok)throw Error(data.error);hydrate(data);loading=false;render(); } catch(e) { loading=false;loadError=e.message;render(); } }
+async function loadState(){
+  const [{data:profiles,error:peopleError},{data:leave,error:requestError}]=await Promise.all([
+    supabase.from('profiles').select('id,email,name,allowance,used,role').order('name'),
+    supabase.from('leave_requests').select('id,person,start,end,type,status,note,decision_note,submitted,decided').order('submitted',{ascending:false})
+  ]);
+  if(peopleError||requestError)throw Error(peopleError?.message||requestError?.message);
+  const email=session.user.email.toLowerCase();const current=profiles.find(p=>p.email.toLowerCase()===email);
+  if(!current)throw Error('Your account has not been added to this team. Ask the manager to add your email address.');
+  hydrate({people:profiles,requests:leave.map(r=>({...r,decisionNote:r.decision_note||''})),me:current.id,role:current.role,minimumCoverage:Math.max(1,profiles.length-2)});
+}
+async function load() { try { const auth=await supabase.auth.getSession();session=auth.data.session;if(session)await loadState();loading=false;render(); } catch(e) { loading=false;loadError=e.message;render(); } }
 const mine = () => people.find(p=>p.id===me) || people[0];
 const avatar = (p,small=false) => `<span class="avatar ${small?'small':''}" style="--avatar:${p.color}">${p.initials}</span>`;
 const badge = status => `<span class="badge ${status}"><i></i>${status[0].toUpperCase()+status.slice(1)}</span>`;
@@ -29,7 +53,7 @@ function shell(content) {
     <aside class="sidebar"><div class="brand"><span class="brandmark"><b></b><b></b><b></b><b></b></span><span>team<span class="brandlight">leave</span></span></div>
       <div class="navlabel">WORKSPACE</div><nav aria-label="Main navigation">
       ${['overview','requests','calendar','users'].map(v=>`<button class="navitem ${view===v?'active':''}" data-view="${v}" ${view===v?'aria-current="page"':''}><span class="navicon">${icon(v)}</span>${v==='calendar'?'Team calendar':v==='users'?'Users':v[0].toUpperCase()+v.slice(1)}${v==='requests'&&role==='manager'?`<span class="navcount">${requests.filter(r=>r.status==='pending').length}</span>`:''}</button>`).join('')}
-      </nav><div class="sidebottom"><a class="textbtn" href="/signout-with-chatgpt?return_to=%2Flogin" target="_top">Sign out</a></div>
+      </nav><div class="sidebottom"><button class="textbtn" data-action="signout">Sign out</button></div>
     </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view==='calendar'?'Team calendar':view==='users'?'Users':view[0].toUpperCase()+view.slice(1)}</div><div class="toptools"><span class="private"><span class="lock">●</span> Private team</span><span class="private">${escapeHtml(mine()?.name||'Team member')} · ${role}</span>${mine()?avatar(mine(),true):''}</div></header>
     <main class="main">${content}</main></div></div>${modal?renderModal():''}<div id="toast" role="status" aria-live="polite"></div>`;
 }
@@ -104,7 +128,8 @@ function renderModal() {
 
 function render() {
   if(loading){app.innerHTML='<main class="main"><h1>Loading team leave…</h1></main>';return;}
-  if(loadError){app.innerHTML=`<main class="main"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><a href="/login">Go to sign in</a></main>`;return;}
+  if(!session){app.innerHTML=`<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>Enter your invited work email. We’ll send you a secure sign-in link.</p><form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com"></label><div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">Send sign-in link</button></form></section></main>`;return;}
+  if(loadError){app.innerHTML=`<main class="loginpage"><section class="logincard"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" data-action="signout">Return to sign in</button></section></main>`;return;}
   app.innerHTML=shell(view==='overview'?overview():view==='requests'?requestsPage():view==='users'?usersPage():calendarPage());
   if (modal?.kind==='new') updatePreview();
   if(modal) document.querySelector('.dialogclose')?.focus();
@@ -126,6 +151,7 @@ app.addEventListener('click',async e=>{
   const date=e.target.closest('[data-date]'); if(date){selectedDay=date.dataset.date;month=new Date(parseDate(selectedDay).getFullYear(),parseDate(selectedDay).getMonth(),1);render();return;}
   const button=e.target.closest('[data-action]'); if(!button)return;
   if(button.dataset.action==='close'){if(e.target===button || button.tagName==='BUTTON'){modal=null;render();}return;}
+  if(button.dataset.action==='signout'){await supabase.auth.signOut();session=null;render();return;}
   if(button.dataset.action==='new'){modal={kind:'new'};render();return;}
   if(button.dataset.action==='queue'){view='requests';render();return;}
   if(button.dataset.action==='adduser'&&role==='manager'){modal={kind:'adduser'};render();return;}
@@ -135,6 +161,7 @@ app.addEventListener('click',async e=>{
 app.addEventListener('input',e=>{if(e.target.closest('#requestform')){updatePreview();setError('');}});
 app.addEventListener('change',e=>{if(e.target.closest('#requestform'))updatePreview();});
 app.addEventListener('submit',async e=>{
+  if(e.target.id==='loginform'){e.preventDefault();const f=e.target;setError('');const {error}=await supabase.auth.signInWithOtp({email:f.elements.email.value.trim(),options:{emailRedirectTo:location.href.split('#')[0]}});if(error){setError(error.message)}else{f.innerHTML='<div class="okbox">Check your email and open the secure sign-in link.</div>'}return;}
   if(e.target.id==='edituserform'){e.preventDefault();const f=e.target;try{await save('/api/people/'+encodeURIComponent(modal.id),{name:f.elements.name.value,allowance:Number(f.elements.allowance.value),used:Number(f.elements.used.value),role:f.elements.role.value});modal=null;render();toast('User updated.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='teamform'){e.preventDefault();const f=e.target;try{await save('/api/people',{name:f.elements.name.value,email:f.elements.email.value,allowance:Number(f.elements.allowance.value)});modal=null;render();toast('Team member added. Invite this email to the private Site to grant access.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='requestform'){
@@ -153,3 +180,4 @@ app.addEventListener('submit',async e=>{
 });
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&modal){modal=null;render();}});
 load();
+supabase.auth.onAuthStateChange(async (_event,next)=>{if(next?.access_token===session?.access_token)return;session=next;loadError='';if(session){try{await loadState()}catch(e){loadError=e.message}}render();});
