@@ -1,4 +1,4 @@
-import {people, minimumCoverage, iso, parseDate, addBusinessDays, addDays, businessDays, setTeam, remaining, coverageFor, validateRequest} from './logic.mjs';
+import {people, minimumCoverage, holidays, iso, parseDate, addBusinessDays, addDays, businessDays, requestDuration, setTeam, setHolidays, remaining, coverageFor, validateRequest} from './logic.mjs';
 import {createClient} from 'https://esm.sh/@supabase/supabase-js@2';
 
 const SUPABASE_URL = 'https://skezxxnhsvdrwrdxabje.supabase.co';
@@ -6,11 +6,13 @@ const SUPABASE_KEY = 'sb_publishable_9t-QgYU94nmDlBy696rKcQ_Z0IkqiqA';
 const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {auth:{persistSession:true,detectSessionInUrl:true}});
 
 let requests = [];
+let notifications = [];
 let me = null;
 let loading = true;
 let loadError = '';
 let session = null;
 let role = 'employee', view = 'overview', modal = null;
+let requestFilter = 'all';
 let month = new Date(new Date().getFullYear(),new Date().getMonth(),1);
 let selectedDay = iso(new Date());
 const app = document.getElementById('app');
@@ -20,31 +22,36 @@ const pretty = s => parseDate(s).toLocaleDateString('en-CA',{month:'short',day:'
 const longDate = s => parseDate(s).toLocaleDateString('en-CA',{weekday:'long',month:'long',day:'numeric'});
 const range = r => `${pretty(r.start)}${r.start===r.end?'':` – ${pretty(r.end)}`}`;
 const daysLabel = n => `${n} ${n===1?'day':'days'}`;
+const typeLabel = r => `${r.type}${Number(r.portion)===0.5?' · Half day':''}`;
 const rpcFor = (path,data) => {
-  if(path==='/api/people') return ['upsert_profile',{p_email:data.email,p_name:data.name,p_allowance:data.allowance,p_used:0,p_role:'employee'}];
-  const personEdit=path.match(/^\/api\/people\/([^/]+)$/); if(personEdit)return ['upsert_profile',{p_id:personEdit[1],p_name:data.name,p_allowance:data.allowance,p_used:data.used,p_role:data.role}];
-  if(path==='/api/requests')return ['submit_leave',{p_person:data.person,p_start:data.start,p_end:data.end,p_note:data.note||''}];
+  if(path==='/api/people') return ['upsert_profile',{p_email:data.email,p_name:data.name,p_allowance:data.allowance,p_used:0,p_role:'employee',p_team:data.team||'General',p_manager_email:data.managerEmail||null}];
+  const personEdit=path.match(/^\/api\/people\/([^/]+)$/); if(personEdit)return ['upsert_profile',{p_id:personEdit[1],p_name:data.name,p_allowance:data.allowance,p_used:data.used,p_role:data.role,p_team:data.team||'General',p_manager_email:data.managerEmail||null}];
+  if(path==='/api/requests')return ['submit_leave',{p_person:data.person,p_start:data.start,p_end:data.end,p_note:data.note||'',p_type:data.type,p_portion:data.portion}];
+  const requestEdit=path.match(/^\/api\/requests\/([^/]+)$/);if(requestEdit)return ['update_leave',{p_request:requestEdit[1],p_start:data.start,p_end:data.end,p_note:data.note||'',p_type:data.type,p_portion:data.portion}];
   const decision=path.match(/^\/api\/requests\/([^/]+)\/decision$/);if(decision)return ['decide_leave',{p_request:decision[1],p_decision:data.decision,p_note:data.note||'',p_override:!!data.override}];
   const cancel=path.match(/^\/api\/requests\/([^/]+)\/cancel$/);if(cancel)return ['cancel_leave',{p_request:cancel[1]}];
+  if(path==='/api/holidays')return ['upsert_holiday',{p_date:data.date,p_name:data.name}];
   throw Error('Unsupported action.');
 };
 const save = async (path, data) => { const [fn,args]=rpcFor(path,data);const {error}=await supabase.rpc(fn,args);if(error)throw Error(error.message);await loadState(); };
-function hydrate(data) { setTeam(data.people,data.minimumCoverage); requests=data.requests;me=data.me;role=data.role; }
+function hydrate(data) { setTeam(data.people,data.minimumCoverage);setHolidays(data.holidays||[]);requests=data.requests;notifications=data.notifications||[];me=data.me;role=data.role; }
 async function loadState(){
-  const [{data:profiles,error:peopleError},{data:leave,error:requestError}]=await Promise.all([
-    supabase.from('profiles').select('id,email,name,allowance,used,role').order('name'),
-    supabase.from('leave_requests').select('id,person,start,end,type,status,note,decision_note,submitted,decided').order('submitted',{ascending:false})
+  const [{data:profiles,error:peopleError},{data:leave,error:requestError},{data:holidayRows},{data:noticeRows}]=await Promise.all([
+    supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email').order('name'),
+    supabase.from('leave_requests').select('id,person,start,end,type,portion,status,note,decision_note,submitted,decided,decided_by').order('submitted',{ascending:false}),
+    supabase.from('holidays').select('date,name').order('date'),
+    supabase.from('notifications').select('id,title,message,read,created_at').order('created_at',{ascending:false}).limit(25)
   ]);
   if(peopleError||requestError)throw Error(peopleError?.message||requestError?.message);
   const email=session.user.email.toLowerCase();const current=profiles.find(p=>p.email.toLowerCase()===email);
   if(!current)throw Error('Your account has not been added to this team. Ask the manager to add your email address.');
-  hydrate({people:profiles,requests:leave.map(r=>({...r,decisionNote:r.decision_note||''})),me:current.id,role:current.role,minimumCoverage:Math.max(1,profiles.length-2)});
+  hydrate({people:profiles,requests:leave.map(r=>({...r,decisionNote:r.decision_note||''})),holidays:holidayRows||[],notifications:noticeRows||[],me:current.id,role:current.role,minimumCoverage:Math.max(1,profiles.length-2)});
 }
 async function load() { try { const auth=await supabase.auth.getSession();session=auth.data.session;if(session)await loadState();loading=false;render(); } catch(e) { loading=false;loadError=e.message;render(); } }
 const mine = () => people.find(p=>p.id===me) || people[0];
 const avatar = (p,small=false) => `<span class="avatar ${small?'small':''}" style="--avatar:${p.color}">${p.initials}</span>`;
 const badge = status => `<span class="badge ${status}"><i></i>${status[0].toUpperCase()+status.slice(1)}</span>`;
-const icon = name => ({overview:'◫',requests:'▤',calendar:'▦',users:'♙'}[name]);
+const icon = name => ({overview:'◫',requests:'▤',calendar:'▦',reports:'▥',users:'♙'}[name]);
 const riskFor = r => coverageFor(r.start,r.end,requests,r.person,r.id).filter(d=>d.conflict);
 const requestOrder = (a,b) => (a.status==='pending'?0:1)-(b.status==='pending'?0:1) || a.start.localeCompare(b.start);
 
@@ -52,9 +59,9 @@ function shell(content) {
   return `<div class="shell">
     <aside class="sidebar"><div class="brand"><span class="brandmark"><b></b><b></b><b></b><b></b></span><span>team<span class="brandlight">leave</span></span></div>
       <div class="navlabel">WORKSPACE</div><nav aria-label="Main navigation">
-      ${['overview','requests','calendar','users'].map(v=>`<button class="navitem ${view===v?'active':''}" data-view="${v}" ${view===v?'aria-current="page"':''}><span class="navicon">${icon(v)}</span>${v==='calendar'?'Team calendar':v==='users'?'Users':v[0].toUpperCase()+v.slice(1)}${v==='requests'&&role==='manager'?`<span class="navcount">${requests.filter(r=>r.status==='pending').length}</span>`:''}</button>`).join('')}
+      ${['overview','requests','calendar',...(role==='manager'?['reports']:[]),'users'].map(v=>`<button class="navitem ${view===v?'active':''}" data-view="${v}" ${view===v?'aria-current="page"':''}><span class="navicon">${icon(v)}</span>${v==='calendar'?'Team calendar':v[0].toUpperCase()+v.slice(1)}${v==='requests'&&role==='manager'?`<span class="navcount">${requests.filter(r=>r.status==='pending').length}</span>`:''}</button>`).join('')}
       </nav><div class="sidebottom"><button class="textbtn" data-action="signout">Sign out</button></div>
-    </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view==='calendar'?'Team calendar':view==='users'?'Users':view[0].toUpperCase()+view.slice(1)}</div><div class="toptools"><span class="private"><span class="lock">●</span> Private team</span><span class="private">${escapeHtml(mine()?.name||'Team member')} · ${role}</span>${mine()?avatar(mine(),true):''}</div></header>
+    </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view==='calendar'?'Team calendar':view[0].toUpperCase()+view.slice(1)}</div><div class="toptools"><button class="noticebutton" data-action="notifications" aria-label="Notifications">◔${notifications.filter(n=>!n.read).length?`<b>${notifications.filter(n=>!n.read).length}</b>`:''}</button><span class="private"><span class="lock">●</span> Private team</span><span class="private">${escapeHtml(mine()?.name||'Team member')} · ${role}</span>${mine()?avatar(mine(),true):''}</div></header>
     <main class="main">${content}</main></div></div>${modal?renderModal():''}<div id="toast" role="status" aria-live="polite"></div>`;
 }
 
@@ -75,16 +82,17 @@ function requestRows(items, manager) {
   if (!items.length) return '<div class="empty">Nothing here yet. New requests will show up as soon as they are submitted.</div>';
   return `<div class="tablewrap"><table><thead><tr>${manager?'<th>Employee</th>':''}<th>Dates</th><th>Duration</th><th>Status</th>${manager?'<th>Coverage</th>':''}<th class="right">Action</th></tr></thead><tbody>${items.map(r=>{
     const risks = r.status==='pending'?riskFor(r):[];
-    return `<tr>${manager?`<td><div class="cellperson">${avatar(person(r.person),true)}<b>${person(r.person).name}</b></div></td>`:''}<td><b>${range(r)}</b><span class="cellsub">${r.type}</span></td><td>${daysLabel(businessDays(r.start,r.end))}</td><td>${badge(r.status)}${r.decisionNote?`<span class="cellsub decisionnote">${escapeHtml(r.decisionNote)}</span>`:''}</td>${manager?`<td>${risks.length?`<span class="impact caution">⚠ ${daysLabel(risks.length)} at risk</span>`:'<span class="impact good">✓ Covered</span>'}</td>`:''}<td class="right">${manager&&r.status==='pending'?`<button class="rowaction" data-review="${r.id}">Review →</button>`:!manager&&r.status==='pending'?`<button class="rowaction muted" data-cancel="${r.id}">Cancel</button>`:'<span class="dash">—</span>'}</td></tr>`;
+    return `<tr>${manager?`<td><div class="cellperson">${avatar(person(r.person),true)}<b>${person(r.person).name}</b></div></td>`:''}<td><b>${range(r)}</b><span class="cellsub">${typeLabel(r)}</span></td><td>${daysLabel(requestDuration(r))}</td><td>${badge(r.status)}${r.decisionNote?`<span class="cellsub decisionnote">${escapeHtml(r.decisionNote)}</span>`:''}</td>${manager?`<td>${risks.length?`<span class="impact caution">⚠ ${daysLabel(risks.length)} at risk</span>`:'<span class="impact good">✓ Covered</span>'}</td>`:''}<td class="right">${manager&&r.status==='pending'?`<button class="rowaction" data-review="${r.id}">Review →</button>`:!manager&&r.status==='pending'?`<button class="rowaction" data-editrequest="${r.id}">Edit</button> <button class="rowaction muted" data-cancel="${r.id}">Cancel</button>`:'<span class="dash">—</span>'}</td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 function requestsPage() {
-  const list = role==='manager'?[...requests].sort(requestOrder):requests.filter(r=>r.person===me).sort(requestOrder);
+  const source = role==='manager'?[...requests]:requests.filter(r=>r.person===me);
+  const list = source.filter(r=>requestFilter==='all'||r.status===requestFilter).sort(requestOrder);
   const pending = list.filter(r=>r.status==='pending').length;
   const b = remaining(me,requests);
   return `<div class="pageheading"><div><div class="eyebrow">${role==='manager'?'APPROVALS':'MY REQUESTS'}</div><h1>${role==='manager'?'Requests & decisions':'Your requests'}</h1><p>${role==='manager'?'Make decisions with leave balances and coverage in view.':'Submit time off and follow each request through to a decision.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
   ${role==='employee'?`<section class="balancebar"><div><span class="eyebrow">${new Date().getFullYear()} BALANCE</span><strong>${b.available} <small>days available</small></strong></div><div class="balanceitems"><span><b>${b.allowance}</b> annual</span><span><b>${b.used}</b> used</span><span><b>${b.approved}</b> approved ahead</span><span><b>${b.pending}</b> awaiting approval</span></div></section>`:`<div class="queueintro"><span class="queueicon">◷</span><div><b>${pending} ${pending===1?'request needs':'requests need'} a decision</b><span>Coverage warnings are based on approved leave and a ${minimumCoverage}-person minimum.</span></div></div>`}
-  <section class="panel requestspanel"><div class="sectionhead"><div><span class="eyebrow">${role==='manager'?'TEAM':'HISTORY'}</span><h3>${role==='manager'?'All team requests':'All your requests'}</h3></div><span class="countpill">${list.length} total</span></div>${requestRows(list,role==='manager')}</section>`;
+  <section class="panel requestspanel"><div class="sectionhead"><div><span class="eyebrow">${role==='manager'?'TEAM':'HISTORY'}</span><h3>${role==='manager'?'All team requests':'All your requests'}</h3></div><div class="filtertabs">${['all','pending','approved','declined','cancelled'].map(s=>`<button class="${requestFilter===s?'active':''}" data-filter="${s}">${s[0].toUpperCase()+s.slice(1)}</button>`).join('')}</div></div>${requestRows(list,role==='manager')}</section>`;
 }
 
 function calendarPage() {
@@ -100,26 +108,35 @@ function calendarPage() {
     const date=iso(d), active=d.getMonth()===m, events=requests.filter(r=>r.start<=date&&r.end>=date&&r.status==='approved'), waits=requests.filter(r=>r.start<=date&&r.end>=date&&r.status==='pending');
     return `<button class="calday ${active?'':'outside'} ${selectedDay===date?'chosen':''} ${date===iso(new Date())?'todaydate':''}" data-date="${date}" aria-label="${longDate(date)}, ${events.length} approved absences"><span class="daynum">${d.getDate()}</span><span class="calentries">${events.slice(0,2).map(r=>`<span class="calentry" style="--event:${person(r.person).color}">${person(r.person).name.split(' ')[0]}</span>`).join('')}${events.length>2?`<span class="moreevents">+${events.length-2} more</span>`:''}${waits.length?`<span class="pendingdot" title="${waits.length} pending">· ${waits.length} pending</span>`:''}</span></button>`;
   }).join('')}</div><div class="callegend"><span><i class="legendapproved"></i>Approved</span><span><i class="legendpending"></i>Pending</span></div></section>
-  <aside class="panel daypanel"><span class="eyebrow">DAILY SNAPSHOT</span><h3>${longDate(selectedDay)}</h3><div class="coveragefigure"><strong>${availability?availability.available:people.length}<small> / ${people.length}</small></strong><span>available to work</span></div><div class="meter"><span style="width:${(availability?availability.available:people.length)/people.length*100}%"></span></div><p class="threshold ${availability?.conflict?'at-risk':''}">${availability?.conflict?'⚠ Below coverage minimum':`✓ Minimum ${minimumCoverage} people covered`}</p><div class="daydivider"></div><h4>Away that day <span>${chosen.length}</span></h4>${chosen.length?chosen.map(r=>`<div class="dayperson">${avatar(person(r.person),true)}<div><b>${person(r.person).name}</b><span>Vacation · ${range(r)}</span></div></div>`).join(''):'<p class="quiet">Nobody is away on approved leave.</p>'}${pendingOnDay.length?`<h4 class="pendingtitle">Pending <span>${pendingOnDay.length}</span></h4>${pendingOnDay.map(r=>`<div class="dayperson">${avatar(person(r.person),true)}<div><b>${person(r.person).name}</b><span>Awaiting approval</span></div></div>`).join('')}`:''}</aside></div>`;
+  <aside class="panel daypanel"><span class="eyebrow">DAILY SNAPSHOT</span><h3>${longDate(selectedDay)}</h3>${holidays.includes(selectedDay)?'<div class="holidayflag">Holiday</div>':''}<div class="coveragefigure"><strong>${availability?availability.available:people.length}<small> / ${people.length}</small></strong><span>available to work</span></div><div class="meter"><span style="width:${(availability?availability.available:people.length)/people.length*100}%"></span></div><p class="threshold ${availability?.conflict?'at-risk':''}">${availability?.conflict?'⚠ Below coverage minimum':`✓ Minimum ${minimumCoverage} people covered`}</p><div class="daydivider"></div><h4>Away that day <span>${chosen.length}</span></h4>${chosen.length?chosen.map(r=>`<div class="dayperson">${avatar(person(r.person),true)}<div><b>${person(r.person).name}</b><span>${typeLabel(r)} · ${range(r)}</span></div></div>`).join(''):'<p class="quiet">Nobody is away on approved leave.</p>'}${pendingOnDay.length?`<h4 class="pendingtitle">Pending <span>${pendingOnDay.length}</span></h4>${pendingOnDay.map(r=>`<div class="dayperson">${avatar(person(r.person),true)}<div><b>${person(r.person).name}</b><span>Awaiting approval</span></div></div>`).join('')}`:''}</aside></div>`;
+}
+
+function reportsPage(){
+  const approved=requests.filter(r=>r.status==='approved'),used=approved.reduce((n,r)=>n+requestDuration(r),0),teams=[...new Set(people.map(p=>p.team||'General'))];
+  return `<div class="pageheading"><div><div class="eyebrow">TEAM INSIGHTS</div><h1>Leave reports</h1><p>Balances, utilization and approved time away for ${new Date().getFullYear()}.</p></div><div class="reportactions"><button class="secondary" data-action="addholiday">Add holiday</button><button class="secondary" data-action="exportics">Export calendar</button><button class="primary" data-action="exportcsv">Export CSV</button></div></div><section class="stats"><div class="stat"><div class="stathead"><span>Approved leave</span></div><strong>${used}<small> days</small></strong></div><div class="stat"><div class="stathead"><span>Pending decisions</span></div><strong>${requests.filter(r=>r.status==='pending').length}<small> requests</small></strong></div><div class="stat"><div class="stathead"><span>Teams</span></div><strong>${teams.length}<small> groups</small></strong></div></section><section class="panel reportpanel"><div class="sectionhead"><div><span class="eyebrow">BALANCES</span><h3>Team utilization</h3></div></div><div class="reportrows">${people.map(p=>{const b=remaining(p.id,requests),pct=Math.min(100,Math.round((b.used+b.approved)/Math.max(1,b.allowance)*100));return `<div class="reportrow"><div>${avatar(p,true)}<span><b>${escapeHtml(p.name)}</b><small>${escapeHtml(p.team||'General')}</small></span></div><div class="reportbar"><i style="width:${pct}%"></i></div><strong>${b.used+b.approved} / ${b.allowance}</strong></div>`}).join('')}</div></section>`;
 }
 
 function usersPage() {
   const minePerson=mine();
   return `<div class="pageheading"><div><div class="eyebrow">ACCOUNT & ACCESS</div><h1>${role==='manager'?'Team users':'Your account'}</h1><p>${role==='manager'?'Manage team roles and leave balances.':'Your profile and leave balance.'}</p></div>${role==='manager'?'<button class="primary topaction" data-action="adduser">+ Add user</button>':''}</div>
   <section class="panel userspanel"><div class="sectionhead"><div><span class="eyebrow">${role==='manager'?'TEAM DIRECTORY':'PROFILE'}</span><h3>${role==='manager'?`${people.length} users`:'Your details'}</h3></div></div>
-  <div class="userlist">${(role==='manager'?people:[minePerson]).map(p=>`<div class="userrow">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email||'')}</span></div><span class="userrole">${p.role==='manager'?'Manager':'Employee'}</span><span class="userbalance"><b>${remaining(p.id,requests).available}</b> days available</span>${role==='manager'?`<button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button>`:''}</div>`).join('')}</div></section>
+  <div class="userlist">${(role==='manager'?people:[minePerson]).map(p=>`<div class="userrow">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email||'')} · ${escapeHtml(p.team||'General')}</span></div><span class="userrole">${p.role==='manager'?'Manager':'Employee'}</span><span class="userbalance"><b>${remaining(p.id,requests).available}</b> days available</span>${role==='manager'?`<button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button>`:''}</div>`).join('')}</div></section>
   ${role==='manager'?'<p class="userhint">Adding a user creates their team profile. Grant the same email access in the private site sharing settings before they can sign in.</p>':'<p class="userhint">Your manager can update your allowance or role. Use Sign out when you finish.</p>'}`;
 }
 
 function renderModal() {
+  if(modal.kind==='notifications') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">UPDATES</div><h2>Notifications</h2><div class="notificationlist">${notifications.length?notifications.map(n=>`<article class="notification ${n.read?'':'unread'}"><b>${escapeHtml(n.title)}</b><p>${escapeHtml(n.message)}</p><time>${new Date(n.created_at).toLocaleString('en-CA',{dateStyle:'medium',timeStyle:'short'})}</time></article>`).join(''):'<div class="empty">You are all caught up.</div>'}</div></div></div>`;
+  if(modal.kind==='addholiday') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">TEAM CALENDAR</div><h2>Add a holiday</h2><p class="dialoglead">Holidays are excluded from leave duration calculations.</p><form id="holidayform"><label>Date<input name="date" type="date" required></label><label>Holiday name<input name="name" maxlength="100" required placeholder="e.g. Thanksgiving"></label><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add holiday</button></div></form></div></div>`;
   if (modal.kind==='edituser') {
     const p=person(modal.id);if(!p)return '';
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">${escapeHtml(p.email)}</p><form id="edituserform"><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Days already used<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role==='employee'?'selected':''}>Employee</option><option value="manager" ${p.role==='manager'?'selected':''}>Manager</option></select></label><p class="quiet">Changing the balance affects future request checks. Approved requests are counted separately.</p><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">${escapeHtml(p.email)}</p><form id="edituserform"><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team||'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email||'')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Days already used<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role==='employee'?'selected':''}>Employee</option><option value="manager" ${p.role==='manager'?'selected':''}>Manager</option></select></label><p class="quiet">Managers see requests for their team. Administrators can manage all teams.</p><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
   }
-  if (modal.kind==='adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create a team profile for an invited colleague.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add user</button></div></form></div></div>`;
-  if (modal.kind==='new') {
-    const start=iso(addBusinessDays(new Date(),7)), end=iso(addBusinessDays(new Date(),8));
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW REQUEST</div><h2 id="dialog-title">Request time off</h2><p class="dialoglead">Plan your dates. Your manager will see any coverage concerns before deciding.</p><form id="requestform"><label>Employee<select name="person" ${role==='employee'?'disabled':''}>${people.map(p=>`<option value="${p.id}" ${p.id===me?'selected':''}>${escapeHtml(p.name)}</option>`).join('')}</select></label><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage"></textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">Submit request →</button></div></form></div></div>`;
+  if (modal.kind==='adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create a team profile for an invited colleague.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="General" required></label><label>Manager email<input name="managerEmail" type="email"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add user</button></div></form></div></div>`;
+  if (modal.kind==='new'||modal.kind==='editrequest') {
+    const editing=modal.kind==='editrequest', current=editing?requests.find(x=>x.id===modal.id):null;
+    if(editing&&!current)return '';
+    const start=current?.start||iso(addBusinessDays(new Date(),7)), end=current?.end||iso(addBusinessDays(new Date(),8)),selectedPerson=current?.person||me;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">${editing?'EDIT':'NEW'} REQUEST</div><h2 id="dialog-title">${editing?'Update':'Request'} time off</h2><p class="dialoglead">Plan your dates. Your manager will see any coverage concerns before deciding.</p><form id="requestform"><label>Employee<select name="person" ${(role==='employee'||editing)?'disabled':''}>${people.map(p=>`<option value="${p.id}" ${p.id===selectedPerson?'selected':''}>${escapeHtml(p.name)}</option>`).join('')}</select></label><div class="formrow"><label>Absence type<select name="type">${['Vacation','Sick','Personal','Unpaid'].map(t=>`<option ${t===(current?.type||'Vacation')?'selected':''}>${t}</option>`).join('')}</select></label><label>Duration<select name="portion"><option value="1" ${Number(current?.portion||1)===1?'selected':''}>Full day(s)</option><option value="0.5" ${Number(current?.portion)===0.5?'selected':''}>Half day</option></select></label></div><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage">${escapeHtml(current?.note||'')}</textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">${editing?'Update request':'Submit request →'}</button></div></form></div></div>`;
   }
   const r=requests.find(x=>x.id===modal.id); if(!r) return '';
   const risk=riskFor(r), b=remaining(r.person,requests);
@@ -130,22 +147,27 @@ function render() {
   if(loading){app.innerHTML='<main class="main"><h1>Loading team leave…</h1></main>';return;}
   if(!session){app.innerHTML=`<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>Enter your invited work email. We’ll send you a secure sign-in link.</p><form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com"></label><div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">Send sign-in link</button></form></section></main>`;return;}
   if(loadError){app.innerHTML=`<main class="loginpage"><section class="logincard"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" data-action="signout">Return to sign in</button></section></main>`;return;}
-  app.innerHTML=shell(view==='overview'?overview():view==='requests'?requestsPage():view==='users'?usersPage():calendarPage());
-  if (modal?.kind==='new') updatePreview();
+  app.innerHTML=shell(view==='overview'?overview():view==='requests'?requestsPage():view==='users'?usersPage():view==='reports'?reportsPage():calendarPage());
+  if (modal?.kind==='new'||modal?.kind==='editrequest') updatePreview();
   if(modal) document.querySelector('.dialogclose')?.focus();
 }
 function updatePreview() {
   const form=document.getElementById('requestform'), box=document.getElementById('requestpreview'); if(!form||!box)return;
-  const personId=form.elements.person.value, start=form.elements.start.value,end=form.elements.end.value;
-  const days=businessDays(start,end), balance=remaining(personId,requests), risk=coverageFor(start,end,requests,personId).filter(d=>d.conflict);
+  const personId=form.elements.person.value, start=form.elements.start.value,end=form.elements.end.value,portion=Number(form.elements.portion.value);
+  const days=businessDays(start,end)*portion, balance=remaining(personId,requests), risk=coverageFor(start,end,requests,personId,modal?.id).filter(d=>d.conflict);
   box.innerHTML=`<div class="previewline"><span>Weekdays requested</span><b>${daysLabel(days)}</b></div><div class="previewline"><span>Balance after approval</span><b>${balance.available-days} days</b></div><div class="previewline"><span>Team coverage</span><b class="${risk.length?'dangertext':''}">${risk.length?`⚠ ${daysLabel(risk.length)} below minimum`:'✓ No conflict found'}</b></div>`;
 }
 function toast(message) { const el=document.getElementById('toast'); if(!el)return; el.textContent=message; el.classList.add('visible'); setTimeout(()=>el.classList.remove('visible'),3500); }
 function setError(message) { const el=document.getElementById('formerror'); if(el)el.textContent=message; }
+function download(name,text,type){const url=URL.createObjectURL(new Blob([text],{type})),a=document.createElement('a');a.href=url;a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(url),1000);}
+function exportCsv(){const q=v=>`"${String(v??'').replaceAll('"','""')}"`,rows=[['Employee','Email','Team','Type','Start','End','Days','Status','Submitted'],...requests.map(r=>{const p=person(r.person);return[p?.name,p?.email,p?.team,r.type,r.start,r.end,requestDuration(r),r.status,r.submitted]})];download('team-leave-report.csv',rows.map(row=>row.map(q).join(',')).join('\r\n'),'text/csv;charset=utf-8');}
+function exportIcs(){const compact=s=>s.replaceAll('-',''),events=requests.filter(r=>r.status==='approved').map(r=>{const p=person(r.person),end=compact(iso(addDays(parseDate(r.end),1)));return `BEGIN:VEVENT\r\nUID:${r.id}@teamleave\r\nDTSTART;VALUE=DATE:${compact(r.start)}\r\nDTEND;VALUE=DATE:${end}\r\nSUMMARY:${p?.name} — ${typeLabel(r)}\r\nEND:VEVENT`});download('team-leave-calendar.ics',`BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Team Leave//EN\r\n${events.join('\r\n')}\r\nEND:VCALENDAR`,'text/calendar;charset=utf-8');}
 app.addEventListener('click',async e=>{
   const nav=e.target.closest('[data-view]'); if(nav){view=nav.dataset.view;modal=null;render();return;}
+  const filter=e.target.closest('[data-filter]');if(filter){requestFilter=filter.dataset.filter;render();return;}
 
   const edit=e.target.closest('[data-edituser]');if(edit&&role==='manager'){modal={kind:'edituser',id:edit.dataset.edituser};render();return;}
+  const editRequest=e.target.closest('[data-editrequest]');if(editRequest){const r=requests.find(x=>x.id===editRequest.dataset.editrequest);if(r?.person===me&&r.status==='pending'){modal={kind:'editrequest',id:r.id};render();}return;}
   const review=e.target.closest('[data-review]'); if(review){if(role!=='manager')return;modal={kind:'review',id:review.dataset.review};render();return;}
   const cancel=e.target.closest('[data-cancel]'); if(cancel){const r=requests.find(x=>x.id===cancel.dataset.cancel);if(r?.person===me&&r.status==='pending'){try{await save('/api/requests/'+encodeURIComponent(r.id)+'/cancel',{});render();toast('Request cancelled.');}catch(err){toast(err.message)}}return;}
   const date=e.target.closest('[data-date]'); if(date){selectedDay=date.dataset.date;month=new Date(parseDate(selectedDay).getFullYear(),parseDate(selectedDay).getMonth(),1);render();return;}
@@ -153,28 +175,33 @@ app.addEventListener('click',async e=>{
   if(button.dataset.action==='close'){if(e.target===button || button.tagName==='BUTTON'){modal=null;render();}return;}
   if(button.dataset.action==='signout'){await supabase.auth.signOut();session=null;render();return;}
   if(button.dataset.action==='new'){modal={kind:'new'};render();return;}
+  if(button.dataset.action==='notifications'){modal={kind:'notifications'};render();await supabase.rpc('mark_notifications_read');notifications.forEach(n=>n.read=true);return;}
+  if(button.dataset.action==='exportcsv'){exportCsv();return;}
+  if(button.dataset.action==='exportics'){exportIcs();return;}
+  if(button.dataset.action==='addholiday'&&role==='manager'){modal={kind:'addholiday'};render();return;}
   if(button.dataset.action==='queue'){view='requests';render();return;}
   if(button.dataset.action==='adduser'&&role==='manager'){modal={kind:'adduser'};render();return;}
   if(button.dataset.action==='prevmonth'||button.dataset.action==='nextmonth'){month=new Date(month.getFullYear(),month.getMonth()+(button.dataset.action==='prevmonth'?-1:1),1);selectedDay=iso(month);render();return;}
   if(button.dataset.action==='today'){month=new Date(new Date().getFullYear(),new Date().getMonth(),1);selectedDay=iso(new Date());render();}
 });
 app.addEventListener('input',e=>{if(e.target.closest('#requestform')){updatePreview();setError('');}});
-app.addEventListener('change',e=>{if(e.target.closest('#requestform'))updatePreview();});
+app.addEventListener('change',e=>{const f=e.target.closest('#requestform');if(f){if(e.target.name==='portion'&&e.target.value==='0.5')f.elements.end.value=f.elements.start.value;updatePreview();}});
 app.addEventListener('submit',async e=>{
   if(e.target.id==='loginform'){e.preventDefault();const f=e.target;setError('');const {error}=await supabase.auth.signInWithOtp({email:f.elements.email.value.trim(),options:{emailRedirectTo:location.href.split('#')[0]}});if(error){setError(error.message)}else{f.innerHTML='<div class="okbox">Check your email and open the secure sign-in link.</div>'}return;}
-  if(e.target.id==='edituserform'){e.preventDefault();const f=e.target;try{await save('/api/people/'+encodeURIComponent(modal.id),{name:f.elements.name.value,allowance:Number(f.elements.allowance.value),used:Number(f.elements.used.value),role:f.elements.role.value});modal=null;render();toast('User updated.');}catch(err){setError(err.message)}return;}
-  if(e.target.id==='teamform'){e.preventDefault();const f=e.target;try{await save('/api/people',{name:f.elements.name.value,email:f.elements.email.value,allowance:Number(f.elements.allowance.value)});modal=null;render();toast('Team member added. Invite this email to the private Site to grant access.');}catch(err){setError(err.message)}return;}
+  if(e.target.id==='edituserform'){e.preventDefault();const f=e.target;try{await save('/api/people/'+encodeURIComponent(modal.id),{name:f.elements.name.value,allowance:Number(f.elements.allowance.value),used:Number(f.elements.used.value),role:f.elements.role.value,team:f.elements.team.value,managerEmail:f.elements.managerEmail.value.trim()});modal=null;render();toast('User updated.');}catch(err){setError(err.message)}return;}
+  if(e.target.id==='teamform'){e.preventDefault();const f=e.target;try{await save('/api/people',{name:f.elements.name.value,email:f.elements.email.value,allowance:Number(f.elements.allowance.value),team:f.elements.team.value,managerEmail:f.elements.managerEmail.value.trim()});modal=null;render();toast('Team member added. Invite this email to the private Site to grant access.');}catch(err){setError(err.message)}return;}
+  if(e.target.id==='holidayform'){e.preventDefault();const f=e.target;try{await save('/api/holidays',{date:f.elements.date.value,name:f.elements.name.value.trim()});modal=null;render();toast('Holiday added to the team calendar.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='requestform'){
-    e.preventDefault();const f=e.target, personId=f.elements.person.value,start=f.elements.start.value,end=f.elements.end.value;
-    const error=validateRequest({person:personId,start,end},requests);if(error){setError(error);return;}
-    try { await save('/api/requests',{person:personId,start,end,note:f.elements.note.value.trim()});modal=null;view='requests';render();toast('Request submitted for manager review.'); } catch(err){setError(err.message)}return;
+    e.preventDefault();const f=e.target, personId=f.elements.person.value,start=f.elements.start.value,end=f.elements.end.value,portion=Number(f.elements.portion.value),type=f.elements.type.value,editing=modal.kind==='editrequest';
+    const error=portion===0.5&&start!==end?'Half-day requests must start and end on the same date.':validateRequest({person:personId,start,end,portion,excludeId:editing?modal.id:null},requests);if(error){setError(error);return;}
+    try { await save(editing?'/api/requests/'+encodeURIComponent(modal.id):'/api/requests',{person:personId,start,end,note:f.elements.note.value.trim(),type,portion});modal=null;view='requests';render();toast(editing?'Request updated.':'Request submitted for manager review.'); } catch(err){setError(err.message)}return;
   }
   if(e.target.id==='decisionform'){
     e.preventDefault();const f=e.target,decision=e.submitter?.value, r=requests.find(x=>x.id===modal.id),note=f.elements.decisionNote.value.trim();
     if(!r||r.status!=='pending'||role!=='manager')return;
     if(decision==='declined'&&!note){setError('Add a short reason before declining.');return;}
     if(decision==='approved'&&riskFor(r).length&&!f.elements.override?.checked){setError('Confirm that coverage is arranged before approving this conflict.');return;}
-    if(decision==='approved'&&businessDays(r.start,r.end)>remaining(r.person,requests).available){setError('This employee no longer has enough available days.');return;}
+    if(decision==='approved'&&requestDuration(r)>remaining(r.person,requests).available){setError('This employee no longer has enough available days.');return;}
     try{await save('/api/requests/'+encodeURIComponent(r.id)+'/decision',{decision,note,override:!!f.elements.override?.checked});modal=null;render();toast(`Request ${decision}.`)}catch(err){setError(err.message)}
   }
 });
