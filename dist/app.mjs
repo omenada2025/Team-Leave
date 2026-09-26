@@ -11,6 +11,7 @@ let me = null;
 let loading = true;
 let loadError = '';
 let session = null;
+let authMode = 'signin';
 let role = 'employee', view = 'overview', modal = null;
 let requestFilter = 'all';
 let month = new Date(new Date().getFullYear(),new Date().getMonth(),1);
@@ -145,7 +146,7 @@ function renderModal() {
 
 function render() {
   if(loading){app.innerHTML='<main class="main"><h1>Loading team leave…</h1></main>';return;}
-  if(!session){app.innerHTML=`<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>Enter your invited work email. We’ll send you a secure sign-in link.</p><form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com"></label><div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">Send sign-in link</button></form></section></main>`;return;}
+  if(!session){const creating=authMode==='signup';app.innerHTML=`<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>${creating?'Create a password for your invited work email.':'Sign in with your work email and password.'}</p><div class="authtabs" role="tablist" aria-label="Account access"><button type="button" role="tab" aria-selected="${!creating}" class="${!creating?'active':''}" data-auth-mode="signin">Sign in</button><button type="button" role="tab" aria-selected="${creating}" class="${creating?'active':''}" data-auth-mode="signup">Create password</button></div><form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com"></label><label>Password<input name="password" type="password" autocomplete="${creating?'new-password':'current-password'}" minlength="8" required placeholder="At least 8 characters"></label>${creating?'<label>Confirm password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="Repeat your password"></label>':''}<div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">${creating?'Create password':'Sign in'}</button></form><p class="loginhelp">Access is limited to email addresses already added by the team manager.</p></section></main>`;return;}
   if(loadError){app.innerHTML=`<main class="loginpage"><section class="logincard"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" data-action="signout">Return to sign in</button></section></main>`;return;}
   app.innerHTML=shell(view==='overview'?overview():view==='requests'?requestsPage():view==='users'?usersPage():view==='reports'?reportsPage():calendarPage());
   if (modal?.kind==='new'||modal?.kind==='editrequest') updatePreview();
@@ -163,6 +164,7 @@ function download(name,text,type){const url=URL.createObjectURL(new Blob([text],
 function exportCsv(){const q=v=>`"${String(v??'').replaceAll('"','""')}"`,rows=[['Employee','Email','Team','Type','Start','End','Days','Status','Submitted'],...requests.map(r=>{const p=person(r.person);return[p?.name,p?.email,p?.team,r.type,r.start,r.end,requestDuration(r),r.status,r.submitted]})];download('team-leave-report.csv',rows.map(row=>row.map(q).join(',')).join('\r\n'),'text/csv;charset=utf-8');}
 function exportIcs(){const compact=s=>s.replaceAll('-',''),events=requests.filter(r=>r.status==='approved').map(r=>{const p=person(r.person),end=compact(iso(addDays(parseDate(r.end),1)));return `BEGIN:VEVENT\r\nUID:${r.id}@teamleave\r\nDTSTART;VALUE=DATE:${compact(r.start)}\r\nDTEND;VALUE=DATE:${end}\r\nSUMMARY:${p?.name} — ${typeLabel(r)}\r\nEND:VEVENT`});download('team-leave-calendar.ics',`BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Team Leave//EN\r\n${events.join('\r\n')}\r\nEND:VCALENDAR`,'text/calendar;charset=utf-8');}
 app.addEventListener('click',async e=>{
+  const authTab=e.target.closest('[data-auth-mode]');if(authTab){authMode=authTab.dataset.authMode;render();return;}
   const nav=e.target.closest('[data-view]'); if(nav){view=nav.dataset.view;modal=null;render();return;}
   const filter=e.target.closest('[data-filter]');if(filter){requestFilter=filter.dataset.filter;render();return;}
 
@@ -187,7 +189,14 @@ app.addEventListener('click',async e=>{
 app.addEventListener('input',e=>{if(e.target.closest('#requestform')){updatePreview();setError('');}});
 app.addEventListener('change',e=>{const f=e.target.closest('#requestform');if(f){if(e.target.name==='portion'&&e.target.value==='0.5')f.elements.end.value=f.elements.start.value;updatePreview();}});
 app.addEventListener('submit',async e=>{
-  if(e.target.id==='loginform'){e.preventDefault();const f=e.target;setError('');const {error}=await supabase.auth.signInWithOtp({email:f.elements.email.value.trim(),options:{emailRedirectTo:location.href.split('#')[0]}});if(error){setError(error.message)}else{f.innerHTML='<div class="okbox">Check your email and open the secure sign-in link.</div>'}return;}
+  if(e.target.id==='loginform'){
+    e.preventDefault();const f=e.target,email=f.elements.email.value.trim().toLowerCase(),password=f.elements.password.value;setError('');
+    if(authMode==='signup'&&password!==f.elements.confirmPassword.value){setError('Passwords do not match.');return;}
+    const result=authMode==='signup'?await supabase.auth.signUp({email,password}):await supabase.auth.signInWithPassword({email,password});
+    if(result.error){setError(result.error.message);return;}
+    if(authMode==='signup'&&!result.data.session){f.innerHTML='<div class="okbox">Account created. If email confirmation is enabled, check your inbox before signing in.</div>';return;}
+    session=result.data.session;loadError='';if(session){try{await loadState()}catch(err){loadError=err.message}}render();return;
+  }
   if(e.target.id==='edituserform'){e.preventDefault();const f=e.target;try{await save('/api/people/'+encodeURIComponent(modal.id),{name:f.elements.name.value,allowance:Number(f.elements.allowance.value),used:Number(f.elements.used.value),role:f.elements.role.value,team:f.elements.team.value,managerEmail:f.elements.managerEmail.value.trim()});modal=null;render();toast('User updated.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='teamform'){e.preventDefault();const f=e.target;try{await save('/api/people',{name:f.elements.name.value,email:f.elements.email.value,allowance:Number(f.elements.allowance.value),team:f.elements.team.value,managerEmail:f.elements.managerEmail.value.trim()});modal=null;render();toast('Team member added. Invite this email to the private Site to grant access.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='holidayform'){e.preventDefault();const f=e.target;try{await save('/api/holidays',{date:f.elements.date.value,name:f.elements.name.value.trim()});modal=null;render();toast('Holiday added to the team calendar.');}catch(err){setError(err.message)}return;}
