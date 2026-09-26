@@ -1,4 +1,4 @@
-import {people, minimumCoverage, holidays, iso, parseDate, addBusinessDays, addDays, businessDays, requestDuration, setTeam, setHolidays, remaining, coverageFor, validateRequest} from './logic.mjs';
+import {people, minimumCoverage, holidays, iso, parseDate, addBusinessDays, addDays, businessDays, requestDuration, balanceDuration, setTeam, setHolidays, remaining, coverageFor, validateRequest} from './logic.mjs';
 import {createClient} from 'https://esm.sh/@supabase/supabase-js@2';
 
 const SUPABASE_URL = 'https://skezxxnhsvdrwrdxabje.supabase.co';
@@ -52,7 +52,7 @@ const mine = () => people.find(p=>p.id===me) || people[0];
 const avatar = (p,small=false) => `<span class="avatar ${small?'small':''}" style="--avatar:${p.color}">${p.initials}</span>`;
 const badge = status => `<span class="badge ${status}"><i></i>${status[0].toUpperCase()+status.slice(1)}</span>`;
 const icon = name => ({overview:'◫',requests:'▤',calendar:'▦',reports:'▥',users:'♙'}[name]);
-const riskFor = r => coverageFor(r.start,r.end,requests,r.person,r.id).filter(d=>d.conflict);
+const riskFor = r => r.type==='Work From Home'?[]:coverageFor(r.start,r.end,requests,r.person,r.id).filter(d=>d.conflict);
 const requestOrder = (a,b) => (a.status==='pending'?0:1)-(b.status==='pending'?0:1) || a.start.localeCompare(b.start);
 
 function shell(content) {
@@ -112,7 +112,7 @@ function calendarPage() {
 }
 
 function reportsPage(){
-  const approved=requests.filter(r=>r.status==='approved'),used=approved.reduce((n,r)=>n+requestDuration(r),0),teams=[...new Set(people.map(p=>p.team||'General'))];
+  const approved=requests.filter(r=>r.status==='approved'),used=approved.reduce((n,r)=>n+balanceDuration(r),0),teams=[...new Set(people.map(p=>p.team||'General'))];
   return `<div class="pageheading"><div><div class="eyebrow">TEAM INSIGHTS</div><h1>Leave reports</h1><p>Balances, utilization and approved time away for ${new Date().getFullYear()}.</p></div><div class="reportactions"><button class="secondary" data-action="addholiday">Add holiday</button><button class="secondary" data-action="exportics">Export calendar</button><button class="primary" data-action="exportcsv">Export CSV</button></div></div><section class="stats"><div class="stat"><div class="stathead"><span>Approved leave</span></div><strong>${used}<small> days</small></strong></div><div class="stat"><div class="stathead"><span>Pending decisions</span></div><strong>${requests.filter(r=>r.status==='pending').length}<small> requests</small></strong></div><div class="stat"><div class="stathead"><span>Teams</span></div><strong>${teams.length}<small> groups</small></strong></div></section><section class="panel reportpanel"><div class="sectionhead"><div><span class="eyebrow">BALANCES</span><h3>Team utilization</h3></div></div><div class="reportrows">${people.map(p=>{const b=remaining(p.id,requests),pct=Math.min(100,Math.round((b.used+b.approved)/Math.max(1,b.allowance)*100));return `<div class="reportrow"><div>${avatar(p,true)}<span><b>${escapeHtml(p.name)}</b><small>${escapeHtml(p.team||'General')}</small></span></div><div class="reportbar"><i style="width:${pct}%"></i></div><strong>${b.used+b.approved} / ${b.allowance}</strong></div>`}).join('')}</div></section>`;
 }
 
@@ -136,7 +136,7 @@ function renderModal() {
     const editing=modal.kind==='editrequest', current=editing?requests.find(x=>x.id===modal.id):null;
     if(editing&&!current)return '';
     const start=current?.start||iso(addBusinessDays(new Date(),7)), end=current?.end||iso(addBusinessDays(new Date(),8)),selectedPerson=current?.person||me;
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">${editing?'EDIT':'NEW'} REQUEST</div><h2 id="dialog-title">${editing?'Update':'Request'} time off</h2><p class="dialoglead">Plan your dates. Your manager will see any coverage concerns before deciding.</p><form id="requestform"><label>Employee<select name="person" ${(role==='employee'||editing)?'disabled':''}>${people.map(p=>`<option value="${p.id}" ${p.id===selectedPerson?'selected':''}>${escapeHtml(p.name)}</option>`).join('')}</select></label><div class="formrow"><label>Absence type<select name="type">${['Vacation','Sick','Personal','Unpaid'].map(t=>`<option ${t===(current?.type||'Vacation')?'selected':''}>${t}</option>`).join('')}</select></label><label>Duration<select name="portion"><option value="1" ${Number(current?.portion||1)===1?'selected':''}>Full day(s)</option><option value="0.5" ${Number(current?.portion)===0.5?'selected':''}>Half day</option></select></label></div><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage">${escapeHtml(current?.note||'')}</textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">${editing?'Update request':'Submit request →'}</button></div></form></div></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">${editing?'EDIT':'NEW'} REQUEST</div><h2 id="dialog-title">${editing?'Update':'Submit'} a request</h2><p class="dialoglead">Request leave or a work-from-home day. Your manager will review the details.</p><form id="requestform"><label>Employee<select name="person" ${(role==='employee'||editing)?'disabled':''}>${people.map(p=>`<option value="${p.id}" ${p.id===selectedPerson?'selected':''}>${escapeHtml(p.name)}</option>`).join('')}</select></label><div class="formrow"><label>Request type<select name="type">${['Vacation','Sick','Personal','Unpaid','Work From Home'].map(t=>`<option ${t===(current?.type||'Vacation')?'selected':''}>${t}</option>`).join('')}</select></label><label>Duration<select name="portion"><option value="1" ${Number(current?.portion||1)===1?'selected':''}>Full day(s)</option><option value="0.5" ${Number(current?.portion)===0.5?'selected':''}>Half day</option></select></label></div><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage">${escapeHtml(current?.note||'')}</textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">${editing?'Update request':'Submit request →'}</button></div></form></div></div>`;
   }
   const r=requests.find(x=>x.id===modal.id); if(!r) return '';
   const risk=riskFor(r), b=remaining(r.person,requests);
@@ -153,9 +153,9 @@ function render() {
 }
 function updatePreview() {
   const form=document.getElementById('requestform'), box=document.getElementById('requestpreview'); if(!form||!box)return;
-  const personId=form.elements.person.value, start=form.elements.start.value,end=form.elements.end.value,portion=Number(form.elements.portion.value);
-  const days=businessDays(start,end)*portion, balance=remaining(personId,requests), risk=coverageFor(start,end,requests,personId,modal?.id).filter(d=>d.conflict);
-  box.innerHTML=`<div class="previewline"><span>Weekdays requested</span><b>${daysLabel(days)}</b></div><div class="previewline"><span>Balance after approval</span><b>${balance.available-days} days</b></div><div class="previewline"><span>Team coverage</span><b class="${risk.length?'dangertext':''}">${risk.length?`⚠ ${daysLabel(risk.length)} below minimum`:'✓ No conflict found'}</b></div>`;
+  const personId=form.elements.person.value, start=form.elements.start.value,end=form.elements.end.value,portion=Number(form.elements.portion.value),type=form.elements.type.value;
+  const days=businessDays(start,end)*portion, balance=remaining(personId,requests),isRemote=type==='Work From Home',risk=coverageFor(start,end,requests,isRemote?null:personId,modal?.id).filter(d=>d.conflict);
+  box.innerHTML=`<div class="previewline"><span>Weekdays requested</span><b>${daysLabel(days)}</b></div><div class="previewline"><span>Balance after approval</span><b>${isRemote?balance.available:balance.available-days} days</b></div><div class="previewline"><span>Team coverage</span><b class="${risk.length?'dangertext':''}">${isRemote?'✓ Working remotely':risk.length?`⚠ ${daysLabel(risk.length)} below minimum`:'✓ No conflict found'}</b></div>`;
 }
 function toast(message) { const el=document.getElementById('toast'); if(!el)return; el.textContent=message; el.classList.add('visible'); setTimeout(()=>el.classList.remove('visible'),3500); }
 function setError(message) { const el=document.getElementById('formerror'); if(el)el.textContent=message; }
@@ -193,7 +193,7 @@ app.addEventListener('submit',async e=>{
   if(e.target.id==='holidayform'){e.preventDefault();const f=e.target;try{await save('/api/holidays',{date:f.elements.date.value,name:f.elements.name.value.trim()});modal=null;render();toast('Holiday added to the team calendar.');}catch(err){setError(err.message)}return;}
   if(e.target.id==='requestform'){
     e.preventDefault();const f=e.target, personId=f.elements.person.value,start=f.elements.start.value,end=f.elements.end.value,portion=Number(f.elements.portion.value),type=f.elements.type.value,editing=modal.kind==='editrequest';
-    const error=portion===0.5&&start!==end?'Half-day requests must start and end on the same date.':validateRequest({person:personId,start,end,portion,excludeId:editing?modal.id:null},requests);if(error){setError(error);return;}
+    const error=portion===0.5&&start!==end?'Half-day requests must start and end on the same date.':validateRequest({person:personId,start,end,type,portion,excludeId:editing?modal.id:null},requests);if(error){setError(error);return;}
     try { await save(editing?'/api/requests/'+encodeURIComponent(modal.id):'/api/requests',{person:personId,start,end,note:f.elements.note.value.trim(),type,portion});modal=null;view='requests';render();toast(editing?'Request updated.':'Request submitted for manager review.'); } catch(err){setError(err.message)}return;
   }
   if(e.target.id==='decisionform'){
@@ -201,7 +201,7 @@ app.addEventListener('submit',async e=>{
     if(!r||r.status!=='pending'||role!=='manager')return;
     if(decision==='declined'&&!note){setError('Add a short reason before declining.');return;}
     if(decision==='approved'&&riskFor(r).length&&!f.elements.override?.checked){setError('Confirm that coverage is arranged before approving this conflict.');return;}
-    if(decision==='approved'&&requestDuration(r)>remaining(r.person,requests).available){setError('This employee no longer has enough available days.');return;}
+    if(decision==='approved'&&balanceDuration(r)>remaining(r.person,requests).available){setError('This employee no longer has enough available days.');return;}
     try{await save('/api/requests/'+encodeURIComponent(r.id)+'/decision',{decision,note,override:!!f.elements.override?.checked});modal=null;render();toast(`Request ${decision}.`)}catch(err){setError(err.message)}
   }
 });

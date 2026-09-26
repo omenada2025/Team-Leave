@@ -22,6 +22,7 @@ export function businessDates(start, end) {
 }
 export const businessDays = (start, end) => businessDates(start, end).length;
 export const requestDuration = r => businessDays(r.start,r.end)*(Number(r.portion)||1);
+export const balanceDuration = r => r.type==='Work From Home'?0:requestDuration(r);
 export function sampleRequests(today = new Date()) {
   const day = n => iso(addBusinessDays(today,n));
   return [
@@ -37,20 +38,20 @@ export function remaining(personId, requests) {
   const person = people.find(p=>p.id===personId);
   if (!person) return {allowance:0,used:0,approved:0,pending:0,available:0};
   const currentYear = new Date().getFullYear();
-  const approved = requests.filter(r=>r.person===personId && r.status==='approved' && +r.start.slice(0,4)===currentYear).reduce((n,r)=>n+requestDuration(r),0);
-  const pending = requests.filter(r=>r.person===personId && r.status==='pending' && +r.start.slice(0,4)===currentYear).reduce((n,r)=>n+requestDuration(r),0);
+  const approved = requests.filter(r=>r.person===personId && r.status==='approved' && +r.start.slice(0,4)===currentYear).reduce((n,r)=>n+balanceDuration(r),0);
+  const pending = requests.filter(r=>r.person===personId && r.status==='pending' && +r.start.slice(0,4)===currentYear).reduce((n,r)=>n+balanceDuration(r),0);
   return { allowance:person.allowance, used:person.used, approved, pending, available:person.allowance-person.used-approved };
 }
 export function coverageFor(start, end, requests, candidatePerson = null, excludedId = null) {
   return businessDates(start,end).map(date=>{
-    const approved = new Set(requests.filter(r=>r.status==='approved' && r.id!==excludedId && r.start<=date && r.end>=date).map(r=>r.person));
+    const approved = new Set(requests.filter(r=>r.status==='approved' && r.type!=='Work From Home' && r.id!==excludedId && r.start<=date && r.end>=date).map(r=>r.person));
     const pending = new Set(requests.filter(r=>r.status==='pending' && r.id!==excludedId && r.start<=date && r.end>=date).map(r=>r.person));
     if (candidatePerson) { approved.add(candidatePerson); pending.delete(candidatePerson); }
     const available = people.length-approved.size;
     return { date, approved:[...approved], pending:[...pending], available, conflict:available<minimumCoverage };
   });
 }
-export function validateRequest({start,end,person,portion=1,excludeId=null}, requests, today=new Date()) {
+export function validateRequest({start,end,person,type='Vacation',portion=1,excludeId=null}, requests, today=new Date()) {
   if (!start || !end) return 'Choose a start and end date.';
   if (end<start) return 'The end date must be on or after the start date.';
   if (start<iso(today)) return 'Choose a future date or today.';
@@ -58,6 +59,6 @@ export function validateRequest({start,end,person,portion=1,excludeId=null}, req
   const days = businessDays(start,end)*Number(portion);
   if (!days) return 'Select at least one weekday.';
   if (requests.some(r=>r.id!==excludeId && r.person===person && r.status!=='declined' && r.status!=='cancelled' && r.start<=end && r.end>=start)) return 'You already have a request on these dates.';
-  if (days>remaining(person,requests).available) return 'This request exceeds the available balance.';
+  if (type!=='Work From Home' && days>remaining(person,requests).available) return 'This request exceeds the available balance.';
   return null;
 }
