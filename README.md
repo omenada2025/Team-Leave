@@ -43,9 +43,9 @@ Do **not** run `supabase/add_work_from_home.sql` — it is obsolete; WFH is incl
 ## Inviting teammates
 
 1. A manager uses **Add user** to create a **profile** (email must match their work address). No Auth user or temporary password is created by the app.
-2. Share the app link. The teammate opens Team Leave → **Create password** with that same email.
+2. Share the app link. The teammate opens Team Leave → **Create password** with that same email (or **Sign in** if they already have an Auth account).
 3. Signup calls `is_invited_email` first; emails not on `profiles` are rejected.
-4. Optional (Dashboard): Authentication → Users → Invite user with the same email. Prefer this if you want Supabase to send the invite email. Never put passwords in email bodies.
+4. Keep **Email** signup enabled in Supabase Auth so Create password works, or invite users from **Authentication → Users** in the Dashboard instead. Never put passwords in email bodies.
 
 There is no service-role key in the frontend. Admin invite from the app would need a Supabase Edge Function or Dashboard action — not shipped here.
 

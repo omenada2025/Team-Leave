@@ -102,6 +102,31 @@ returns numeric language sql stable set search_path=public as $$
   select case when p_type = 'Vacation' then public.leave_duration(p_start, p_end, p_portion) else 0 end
 $$;
 
+-- Remaining Vacation days. profiles.used is carry-in only.
+-- p_include_pending: true for submit/update (block oversubscription); false for decide (row is still pending).
+-- p_exclude: request id to ignore (the row being edited).
+create or replace function public.vacation_available(
+  p_person uuid,
+  p_year integer,
+  p_include_pending boolean default true,
+  p_exclude uuid default null
+) returns numeric language sql stable set search_path=public as $$
+  select greatest(0,
+    coalesce((select p.allowance - p.used from profiles p where p.id = p_person), 0)
+    - coalesce((
+        select sum(public.balance_duration(r.type, r.start, r."end", r.portion))
+        from leave_requests r
+        where r.person = p_person
+          and extract(year from r.start) = p_year
+          and (p_exclude is null or r.id <> p_exclude)
+          and (
+            r.status = 'approved'
+            or (p_include_pending and r.status = 'pending')
+          )
+      ), 0)
+  )
+$$;
+
 create or replace function public.coverage_minimum() returns integer
 language sql stable set search_path=public as $$
   select greatest(1, (select count(*)::integer from profiles) - 2)
@@ -255,12 +280,7 @@ begin
 
   v_burn := public.balance_duration(p_type, p_start, p_end, p_portion);
   if v_burn > 0 then
-    select v_person.allowance - v_person.used - coalesce((
-      select sum(public.balance_duration(r.type, r.start, r."end", r.portion))
-      from leave_requests r
-      where r.person = p_person and r.status = 'approved'
-        and extract(year from r.start) = extract(year from p_start)
-    ), 0) into v_available;
+    v_available := public.vacation_available(p_person, extract(year from p_start)::integer, true, null);
     if v_burn > v_available then
       raise exception 'This request exceeds the available balance.';
     end if;
@@ -323,12 +343,7 @@ begin
   select * into v_person from profiles where id = v_row.person;
   v_burn := public.balance_duration(p_type, p_start, p_end, p_portion);
   if v_burn > 0 then
-    select v_person.allowance - v_person.used - coalesce((
-      select sum(public.balance_duration(r.type, r.start, r."end", r.portion))
-      from leave_requests r
-      where r.person = v_row.person and r.status = 'approved'
-        and extract(year from r.start) = extract(year from p_start)
-    ), 0) into v_available;
+    v_available := public.vacation_available(v_row.person, extract(year from p_start)::integer, true, p_request);
     if v_burn > v_available then
       raise exception 'This request exceeds the available balance.';
     end if;
@@ -361,19 +376,14 @@ begin
   select * into v_row from leave_requests where id = p_request and status = 'pending' for update;
   if not found then raise exception 'Pending request not found.'; end if;
   if v_row.person = current_profile_id() then
-    raise exception 'A manager cannot approve their own request.';
+    raise exception 'A manager cannot decide their own request.';
   end if;
 
   if p_decision = 'approved' then
     v_burn := public.balance_duration(v_row.type, v_row.start, v_row."end", v_row.portion);
     if v_burn > 0 then
-      select * into v_person from profiles where id = v_row.person;
-      select v_person.allowance - v_person.used - coalesce((
-        select sum(public.balance_duration(r.type, r.start, r."end", r.portion))
-        from leave_requests r
-        where r.person = v_row.person and r.status = 'approved'
-          and extract(year from r.start) = extract(year from v_row.start)
-      ), 0) into v_available;
+      -- Pending of this row must not count; other pending Vacation still reserved.
+      v_available := public.vacation_available(v_row.person, extract(year from v_row.start)::integer, true, v_row.id);
       if v_burn > v_available then
         raise exception 'The employee no longer has enough available days.';
       end if;

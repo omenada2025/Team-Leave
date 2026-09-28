@@ -41,6 +41,7 @@ export function remaining(personId, requests) {
   const currentYear = new Date().getFullYear();
   const approved = requests.filter(r=>r.person===personId && r.status==='approved' && +r.start.slice(0,4)===currentYear).reduce((n,r)=>n+balanceDuration(r),0);
   const pending = requests.filter(r=>r.person===personId && r.status==='pending' && +r.start.slice(0,4)===currentYear).reduce((n,r)=>n+balanceDuration(r),0);
+  // available = allowance − carry-in − approved Vacation (pending shown separately)
   return { allowance:person.allowance, used:person.used, approved, pending, available:person.allowance-person.used-approved };
 }
 export function coverageFor(start, end, requests, candidatePerson = null, excludedId = null) {
@@ -60,6 +61,10 @@ export function validateRequest({start,end,person,type='Vacation',portion=1,excl
   const days = businessDays(start,end)*Number(portion);
   if (!days) return 'Select at least one weekday.';
   if (requests.some(r=>r.id!==excludeId && r.person===person && r.status!=='declined' && r.status!=='cancelled' && r.start<=end && r.end>=start)) return 'You already have a request on these dates.';
-  if (type==='Vacation' && days>remaining(person,requests).available) return 'This request exceeds the available balance.';
+  if (type==='Vacation') {
+    const bal = remaining(person,requests);
+    const pendingOther = requests.filter(r=>r.id!==excludeId && r.person===person && r.status==='pending' && +r.start.slice(0,4)===today.getFullYear()).reduce((n,r)=>n+balanceDuration(r),0);
+    if (days > bal.available - pendingOther) return 'This request exceeds the available balance.';
+  }
   return null;
 }
