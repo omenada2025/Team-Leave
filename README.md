@@ -1,10 +1,10 @@
 # Team Leave
 
-Private team leave planner for Daniela’s team: balances, request/approve workflow, coverage checks, calendar, holidays, and in-app notifications.
+Private team leave planner for Daniela’s team: balances, request/approve workflow, coverage checks, calendar, holidays, and **in-app notifications only** (no email sender).
 
 **Live stack:** GitHub Pages (`dist/`) + Supabase Auth / Postgres.
 
-An older OpenAI Sites worker + D1 path was retired from this repo so it cannot be mistaken for production.
+Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/` before deploy (CI and Pages do this automatically).
 
 ## Operator setup
 
@@ -12,68 +12,103 @@ An older OpenAI Sites worker + D1 path was retired from this repo so it cannot b
 
 1. Create a project in Supabase.
 2. In **SQL Editor**, run in order:
-   1. `supabase/schema.sql` — full current schema (profiles, leave_requests with portion/types, holidays, notifications, RPCs with decision/balance guards).
-   2. `supabase/seed_canada_holidays_2026.sql` — Ontario 2026 public holidays.
+   1. `supabase/schema.sql` — full current schema.
+   2. `supabase/seed_ontario_holidays.sql` — Ontario ESA holidays 2026–2028 (or use **Load Ontario holidays** in Reports after login).
 3. **Authentication → URL configuration**
    - Site URL: your GitHub Pages URL (e.g. `https://<org>.github.io/Team-Leave/`).
    - Redirect URLs: add that same Pages URL (with and without trailing slash if you use both).
-4. Confirm the publishable key and project URL in `dist/app.mjs` match this project (or update them).
-5. Push to `main`; GitHub Actions deploys the `dist/` folder to Pages.
+4. Confirm the publishable key and project URL in `src/app.mjs` (then rebuild) match this project.
+5. Push to `main`; GitHub Actions runs verify checks, then deploys `dist/` to Pages.
 
 ### Existing Supabase project (already deployed)
 
-1. In **SQL Editor**, run `supabase/upgrade_workflow.sql` (idempotent). This restores:
-   - Self-approval block in `decide_leave`
-   - Coverage conflict checks honoring `p_override`
-   - Vacation-only balance checks on submit/update/decide
-   - Holiday-aware weekday × portion math
-   - `is_invited_email` for profile-first signup
-2. If the holidays table is empty, run `supabase/seed_canada_holidays_2026.sql`.
-3. Deploy the updated `dist/` (merge/push this branch).
+1. In **SQL Editor**, run `supabase/upgrade_workflow.sql` (idempotent). This adds:
+   - Team-scoped `decide_leave` / RLS (`manages_person`)
+   - Configurable `team_settings.minimum_coverage`
+   - Soft-deactivate (`profiles.active`)
+   - Holiday delete + region on upsert
+   - Year rollover RPC (`rollover_leave_year`, carry-over = 0)
+   - Drops unused `email_events` (in-app notifications only)
+   - Self-approval / coverage / Vacation balance guards (as before)
+2. If holidays are incomplete, run `supabase/seed_ontario_holidays.sql` (or Load Ontario in the app).
+3. Deploy the updated app (merge/push this branch).
 
-Do **not** run `supabase/add_work_from_home.sql` — it is obsolete; WFH is included in schema/upgrade.
+Do **not** run `supabase/add_work_from_home.sql` — it is obsolete.
+
+### SQL / ops Daniela must still do on live Supabase
+
+These cannot be done from the repo alone:
+
+1. **Run `upgrade_workflow.sql`** (then holiday seed if needed) before relying on the new UI.
+2. **Audit `profiles.used`** after the balance policy: if `used` already included approved Vacation, reset carry-in so balances are not double-counted (`available = allowance − used − approved Vacation`).
+3. Optionally enable **Realtime** for `leave_requests` and `notifications` in the Supabase dashboard (the app also polls every ~45s as a fallback).
 
 ## Leave balance rules
 
 - Only **Vacation** deducts from the annual vacation balance.
 - **Work From Home**, **Sick**, **Personal**, and **Unpaid** do not burn vacation days.
-- `profiles.used` is **carry-in / manual adjustment only**. Do not enter the sum of approved requests there — available days = `allowance − used − approved Vacation (holiday-aware, including half-days)`.
-- Coverage minimum = `max(1, headcount − 2)`. Approving below that requires the override checkbox (`p_override`).
+- `profiles.used` is **carry-in / manual adjustment only**.
+- **Carry-over default = 0** — unused vacation does not roll into the next year. At year start, managers use Reports → Reset carry-in (or `rollover_leave_year`) to set `used` to 0 for their team. Approved leave history is kept.
+- Coverage minimum defaults to `max(1, active_headcount − 2)`. Managers can set an absolute minimum in Reports. Approving below that requires the override checkbox (`p_override`).
+
+## Manager team scope
+
+Managers only **see pending/decide** requests for people on the **same `team`** or whose **`manager_email`** matches the manager’s email. Approved absences remain visible on the shared calendar. There is no separate `admin` role.
+
+## Notifications
+
+**In-app only.** The dead `email_events` path was removed. Opening Notifications marks items read and refreshes the unread badge. No Resend (or other) API keys are required.
 
 ## Inviting teammates
 
-1. A manager uses **Add user** to create a **profile** (email must match their work address). No Auth user or temporary password is created by the app.
-2. Share the app link. The teammate opens Team Leave → **Create password** with that same email (or **Sign in** if they already have an Auth account).
-3. Signup calls `is_invited_email` first; emails not on `profiles` are rejected.
-4. Keep **Email** signup enabled in Supabase Auth so Create password works, or invite users from **Authentication → Users** in the Dashboard instead. Never put passwords in email bodies.
+1. A manager uses **Add user** to create a **profile** (no Auth user / temp password).
+2. Share the app link → teammate uses **Create password** with that email.
+3. Signup calls `is_invited_email` (active profiles only).
+4. Keep **Email** signup enabled in Supabase Auth, or invite from the Dashboard. Never put passwords in email bodies.
 
-There is no service-role key in the frontend. Admin invite from the app would need a Supabase Edge Function or Dashboard action — not shipped here.
+## Soft-deactivate users
+
+Managers can uncheck **Active** on Edit user. Deactivated people stay in history, drop out of coverage headcount, and cannot Create password / open the app. Prefer this over deleting profiles.
+
+## Holidays
+
+Reports → **Manage holidays**: add / edit / delete, or **Load Ontario** for the current/next year. Calendar day panel and cell `aria-label` show the holiday **name**.
 
 ## Auth notes
 
-- Sign-in: email + password for addresses already on the team.
-- Create password: only after a manager added the profile.
+- Sign-in: email + password for active team profiles.
+- Create password: only after a manager added (and activated) the profile.
 - Forgot password: Supabase reset email (redirect must be allow-listed).
-- Access after Auth still requires a matching `profiles` row (RLS + client gate).
 
 ## What managers enforce in SQL
 
-`submit_leave` / `update_leave` / `decide_leave` are `security definer` RPCs. Client checks are UX only; the database blocks:
+`submit_leave` / `update_leave` / `decide_leave` are `security definer` RPCs. The database blocks:
 
 - Overlapping active requests
 - Over-balance Vacation
 - Self-approval
 - Coverage conflicts unless `p_override` is true
+- Decisions outside the manager’s team scope
+
+## Local checks
+
+```bash
+bash scripts/build.sh
+node scripts/test-logic.mjs
+node scripts/test-sql.mjs
+```
 
 ## Files
 
 | Path | Role |
 | --- | --- |
-| `dist/` | Deployed SPA (Pages) |
+| `src/` | Editable SPA source |
+| `dist/` | Built copy deployed to Pages |
 | `supabase/schema.sql` | Greenfield install |
 | `supabase/upgrade_workflow.sql` | Existing-project upgrade |
-| `supabase/seed_canada_holidays_2026.sql` | Holiday seed |
-| `.github/workflows/pages.yml` | Pages deploy |
+| `supabase/seed_ontario_holidays.sql` | Holiday seed 2026–2028 |
+| `.github/workflows/ci.yml` | PR/main logic + SQL checks |
+| `.github/workflows/pages.yml` | Verify then deploy Pages |
 
 ## Retired
 

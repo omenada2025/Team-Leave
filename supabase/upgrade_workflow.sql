@@ -1,12 +1,13 @@
 -- Team Leave — upgrade for existing Supabase projects.
--- Idempotent. Replaces older upgrade_workflow.sql / add_work_from_home.sql.
--- Run this once in the SQL editor, then re-run seed_canada_holidays_2026.sql if holidays are missing.
+-- Idempotent. Run once in the SQL editor after deploying this branch.
+-- Then seed holidays if needed (seed_ontario_holidays.sql or in-app Load Ontario holidays).
 --
--- Restores: self-approval block, coverage + p_override, vacation-balance checks,
--- holiday-aware portion math, is_invited_email for profile-first signup.
+-- Adds / restores: team-scoped managers, configurable coverage, soft-deactivate,
+-- holiday delete, year rollover (carry-over = 0), drops unused email_events.
 
 alter table public.profiles add column if not exists team text not null default 'General';
 alter table public.profiles add column if not exists manager_email text;
+alter table public.profiles add column if not exists active boolean not null default true;
 alter table public.leave_requests add column if not exists portion numeric(3,1) not null default 1;
 alter table public.leave_requests add column if not exists decided_by uuid references public.profiles(id);
 
@@ -18,6 +19,14 @@ do $$ begin
   alter table public.leave_requests add constraint leave_requests_type_check
     check (type in ('Vacation','Sick','Personal','Unpaid','Work From Home'));
 exception when duplicate_object then null; end $$;
+
+-- Keep leave history when a profile is removed; soft-delete is preferred.
+do $$ begin
+  alter table public.leave_requests drop constraint if exists leave_requests_person_fkey;
+  alter table public.leave_requests
+    add constraint leave_requests_person_fkey
+    foreign key (person) references public.profiles(id);
+exception when others then null; end $$;
 
 create table if not exists public.holidays (
   date date primary key,
@@ -32,32 +41,50 @@ create table if not exists public.notifications (
   read boolean not null default false,
   created_at timestamptz not null default now()
 );
-create table if not exists public.email_events (
-  id uuid primary key default gen_random_uuid(),
-  event text not null,
-  recipient_email text not null,
-  payload jsonb not null default '{}'::jsonb,
-  status text not null default 'pending',
-  created_at timestamptz not null default now()
+create table if not exists public.team_settings (
+  id integer primary key default 1 check (id = 1),
+  minimum_coverage integer check (minimum_coverage is null or minimum_coverage >= 1),
+  updated_at timestamptz not null default now()
 );
+insert into public.team_settings(id, minimum_coverage) values (1, null)
+on conflict (id) do nothing;
+
+-- Dead email queue — nothing sends these. In-app notifications only.
+drop table if exists public.email_events;
 
 alter table public.holidays enable row level security;
 alter table public.notifications enable row level security;
-alter table public.email_events enable row level security;
+alter table public.team_settings enable row level security;
 
 create or replace function public.current_profile_id() returns uuid
 language sql stable security definer set search_path=public as $$
-  select id from profiles where lower(email)=lower(coalesce(auth.jwt()->>'email','')) limit 1
+  select id from profiles where lower(email)=lower(coalesce(auth.jwt()->>'email','')) and active limit 1
 $$;
 
 create or replace function public.is_manager() returns boolean
 language sql stable security definer set search_path=public as $$
-  select exists(select 1 from profiles where id=current_profile_id() and role='manager')
+  select exists(select 1 from profiles where id=current_profile_id() and role='manager' and active)
+$$;
+
+create or replace function public.manages_person(p_person uuid) returns boolean
+language sql stable security definer set search_path=public as $$
+  select exists(
+    select 1
+    from profiles me
+    join profiles them on them.id = p_person
+    where me.id = current_profile_id()
+      and me.role = 'manager'
+      and me.active
+      and (
+        them.team = me.team
+        or lower(coalesce(them.manager_email, '')) = lower(me.email)
+      )
+  )
 $$;
 
 create or replace function public.is_invited_email(p_email text) returns boolean
 language sql stable security definer set search_path=public as $$
-  select exists(select 1 from profiles where lower(email)=lower(trim(p_email)))
+  select exists(select 1 from profiles where lower(email)=lower(trim(p_email)) and active)
 $$;
 
 create or replace function public.leave_duration(p_start date, p_end date, p_portion numeric)
@@ -98,9 +125,17 @@ create or replace function public.vacation_available(
   )
 $$;
 
+create or replace function public.active_headcount() returns integer
+language sql stable set search_path=public as $$
+  select count(*)::integer from profiles where active
+$$;
+
 create or replace function public.coverage_minimum() returns integer
 language sql stable set search_path=public as $$
-  select greatest(1, (select count(*)::integer from profiles) - 2)
+  select coalesce(
+    (select minimum_coverage from team_settings where id = 1),
+    greatest(1, public.active_headcount() - 2)
+  )
 $$;
 
 create or replace function public.has_coverage_conflict(p_person uuid, p_start date, p_end date, p_exclude uuid default null)
@@ -111,8 +146,8 @@ declare
   v_day date;
   v_away integer;
 begin
-  select count(*)::integer into v_n from profiles;
-  v_min := greatest(1, v_n - 2);
+  v_n := public.active_headcount();
+  v_min := public.coverage_minimum();
   for v_day in
     select g.day::date from generate_series(p_start, p_end, '1 day') as g(day)
     where extract(isodow from g.day) < 6
@@ -120,6 +155,7 @@ begin
   loop
     select count(distinct r.person)::integer into v_away
     from leave_requests r
+    join profiles p on p.id = r.person and p.active
     where r.status = 'approved'
       and r.type <> 'Work From Home'
       and (p_exclude is null or r.id <> p_exclude)
@@ -155,8 +191,22 @@ create policy notifications_own_update on public.notifications
   for update to authenticated
   using (lower(recipient_email)=lower(coalesce(auth.jwt()->>'email','')))
   with check (lower(recipient_email)=lower(coalesce(auth.jwt()->>'email','')));
+drop policy if exists leave_team_read on public.leave_requests;
+create policy leave_team_read on public.leave_requests
+  for select to authenticated
+  using (
+    current_profile_id() is not null and (
+      person = current_profile_id()
+      or status = 'approved'
+      or (is_manager() and manages_person(person))
+    )
+  );
+drop policy if exists team_settings_read on public.team_settings;
+create policy team_settings_read on public.team_settings
+  for select to authenticated using (current_profile_id() is not null);
 
 drop function if exists public.upsert_profile(text,text,integer,integer,text,uuid);
+drop function if exists public.upsert_profile(text,text,integer,integer,text,uuid,text,text);
 create or replace function public.upsert_profile(
   p_email text default null,
   p_name text default null,
@@ -165,7 +215,8 @@ create or replace function public.upsert_profile(
   p_role text default 'employee',
   p_id uuid default null,
   p_team text default 'General',
-  p_manager_email text default null
+  p_manager_email text default null,
+  p_active boolean default true
 ) returns uuid language plpgsql security definer set search_path=public as $$
 declare v_id uuid;
 begin
@@ -177,10 +228,11 @@ begin
       used = p_used,
       role = p_role,
       team = coalesce(nullif(trim(p_team),''),'General'),
-      manager_email = nullif(lower(trim(p_manager_email)),'')
+      manager_email = nullif(lower(trim(p_manager_email)),''),
+      active = coalesce(p_active, active)
     where id = p_id returning id into v_id;
   else
-    insert into profiles(email,name,allowance,used,role,team,manager_email)
+    insert into profiles(email,name,allowance,used,role,team,manager_email,active)
     values(
       lower(trim(p_email)),
       trim(p_name),
@@ -188,16 +240,50 @@ begin
       p_used,
       p_role,
       coalesce(nullif(trim(p_team),''),'General'),
-      nullif(lower(trim(p_manager_email)),'')
+      nullif(lower(trim(p_manager_email)),''),
+      coalesce(p_active, true)
     )
     on conflict(email) do update set
       name = excluded.name,
       allowance = excluded.allowance,
       team = excluded.team,
-      manager_email = excluded.manager_email
+      manager_email = excluded.manager_email,
+      active = true
     returning id into v_id;
   end if;
   return v_id;
+end $$;
+
+create or replace function public.set_profile_active(p_id uuid, p_active boolean)
+returns void language plpgsql security definer set search_path=public as $$
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if p_id = current_profile_id() then raise exception 'You cannot deactivate your own account.'; end if;
+  update profiles set active = p_active where id = p_id;
+  if not found then raise exception 'User not found.'; end if;
+end $$;
+
+create or replace function public.set_minimum_coverage(p_minimum integer)
+returns void language plpgsql security definer set search_path=public as $$
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if p_minimum is not null and p_minimum < 1 then raise exception 'Minimum coverage must be at least 1.'; end if;
+  insert into team_settings(id, minimum_coverage, updated_at)
+  values (1, p_minimum, now())
+  on conflict (id) do update set minimum_coverage = excluded.minimum_coverage, updated_at = now();
+end $$;
+
+create or replace function public.rollover_leave_year()
+returns integer language plpgsql security definer set search_path=public as $$
+declare v_count integer;
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  update profiles p
+  set used = 0
+  where p.active and manages_person(p.id);
+  get diagnostics v_count = row_count;
+  update profiles set used = 0 where id = current_profile_id();
+  return v_count;
 end $$;
 
 drop function if exists public.submit_leave(uuid,date,date,text);
@@ -218,7 +304,7 @@ declare
   v_person profiles%rowtype;
 begin
   if v_me is null then raise exception 'Your email is not on this team.'; end if;
-  if p_person <> v_me and not is_manager() then raise exception 'Not permitted.'; end if;
+  if p_person <> v_me and not (is_manager() and manages_person(p_person)) then raise exception 'Not permitted.'; end if;
   if p_start < current_date or p_end < p_start then raise exception 'Choose valid dates.'; end if;
   if extract(year from p_start) <> extract(year from p_end)
      or extract(year from p_start) <> extract(year from current_date) then
@@ -230,6 +316,9 @@ begin
   if p_portion not in (0.5,1) or (p_portion = 0.5 and p_start <> p_end) then
     raise exception 'Invalid request duration.';
   end if;
+  select * into v_person from profiles where id = p_person and active;
+  if not found then raise exception 'Employee not found.'; end if;
+
   v_days := public.leave_duration(p_start, p_end, p_portion);
   if v_days <= 0 then raise exception 'Choose at least one business day.'; end if;
   if exists(
@@ -237,9 +326,6 @@ begin
     where person = p_person and status in ('pending','approved')
       and daterange(start,"end",'[]') && daterange(p_start,p_end,'[]')
   ) then raise exception 'This request overlaps an existing request.'; end if;
-
-  select * into v_person from profiles where id = p_person;
-  if not found then raise exception 'Employee not found.'; end if;
 
   v_burn := public.balance_duration(p_type, p_start, p_end, p_portion);
   if v_burn > 0 then
@@ -256,12 +342,8 @@ begin
   insert into notifications(recipient_email,title,message)
   select email, 'New request', v_person.name||' submitted a '||p_type||' request ('||v_days||' day(s)).'
   from profiles
-  where role = 'manager' and (team = v_person.team or lower(email) = lower(coalesce(v_person.manager_email,'')));
-
-  insert into email_events(event,recipient_email,payload)
-  select 'request_submitted', email, jsonb_build_object('request_id',v_id,'employee',v_person.name,'type',p_type)
-  from profiles
-  where role = 'manager' and (team = v_person.team or lower(email) = lower(coalesce(v_person.manager_email,'')));
+  where role = 'manager' and active
+    and (team = v_person.team or lower(email) = lower(coalesce(v_person.manager_email,'')));
 
   return v_id;
 end $$;
@@ -279,11 +361,13 @@ declare
   v_days numeric;
   v_burn numeric;
   v_available numeric;
-  v_person profiles%rowtype;
 begin
   select * into v_row from leave_requests where id = p_request and status = 'pending' for update;
   if not found then raise exception 'Pending request not found.'; end if;
-  if v_row.person <> current_profile_id() and not is_manager() then raise exception 'Pending request not found.'; end if;
+  if v_row.person <> current_profile_id()
+     and not (is_manager() and manages_person(v_row.person)) then
+    raise exception 'Pending request not found.';
+  end if;
   if p_start < current_date or p_end < p_start then raise exception 'Choose valid dates.'; end if;
   if extract(year from p_start) <> extract(year from p_end)
      or extract(year from p_start) <> extract(year from current_date) then
@@ -303,7 +387,6 @@ begin
       and daterange(start,"end",'[]') && daterange(p_start,p_end,'[]')
   ) then raise exception 'This request overlaps an existing request.'; end if;
 
-  select * into v_person from profiles where id = v_row.person;
   v_burn := public.balance_duration(p_type, p_start, p_end, p_portion);
   if v_burn > 0 then
     v_available := public.vacation_available(v_row.person, extract(year from p_start)::integer, true, p_request);
@@ -341,6 +424,9 @@ begin
   if v_row.person = current_profile_id() then
     raise exception 'A manager cannot decide their own request.';
   end if;
+  if not manages_person(v_row.person) then
+    raise exception 'You can only decide requests for your team.';
+  end if;
 
   if p_decision = 'approved' then
     v_burn := public.balance_duration(v_row.type, v_row.start, v_row."end", v_row.portion);
@@ -372,8 +458,6 @@ begin
     'Request '||p_decision,
     'Your '||v_row.type||' request for '||v_row.start||' to '||v_row."end"||' was '||p_decision||'.'
   );
-  insert into email_events(event,recipient_email,payload)
-  values('request_'||p_decision, v_person.email, jsonb_build_object('request_id',p_request,'note',coalesce(p_note,'')));
 end $$;
 
 create or replace function public.cancel_leave(p_request uuid) returns void
@@ -391,31 +475,49 @@ language sql security definer set search_path=public as $$
   where lower(recipient_email) = lower(coalesce(auth.jwt()->>'email',''))
 $$;
 
-create or replace function public.upsert_holiday(p_date date, p_name text) returns void
+drop function if exists public.upsert_holiday(date,text);
+create or replace function public.upsert_holiday(p_date date, p_name text, p_region text default 'Ontario') returns void
 language plpgsql security definer set search_path=public as $$
 begin
   if not is_manager() then raise exception 'Manager access required.'; end if;
-  insert into holidays(date,name) values(p_date, trim(p_name))
-  on conflict(date) do update set name = excluded.name;
+  insert into holidays(date,name,region) values(p_date, trim(p_name), coalesce(nullif(trim(p_region),''),'Ontario'))
+  on conflict(date) do update set name = excluded.name, region = excluded.region;
+end $$;
+
+create or replace function public.delete_holiday(p_date date) returns void
+language plpgsql security definer set search_path=public as $$
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  delete from holidays where date = p_date;
+  if not found then raise exception 'Holiday not found.'; end if;
 end $$;
 
 revoke all on function public.is_invited_email(text) from public;
-revoke all on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text) from public,anon;
+revoke all on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) from public,anon;
+revoke all on function public.set_profile_active(uuid,boolean) from public,anon;
+revoke all on function public.set_minimum_coverage(integer) from public,anon;
+revoke all on function public.rollover_leave_year() from public,anon;
 revoke all on function public.submit_leave(uuid,date,date,text,text,numeric) from public,anon;
 revoke all on function public.update_leave(uuid,date,date,text,text,numeric) from public,anon;
 revoke all on function public.decide_leave(uuid,text,text,boolean) from public,anon;
 revoke all on function public.cancel_leave(uuid) from public,anon;
 revoke all on function public.mark_notifications_read() from public,anon;
-revoke all on function public.upsert_holiday(date,text) from public,anon;
+revoke all on function public.upsert_holiday(date,text,text) from public,anon;
+revoke all on function public.delete_holiday(date) from public,anon;
 
 grant execute on function public.is_invited_email(text) to anon, authenticated;
-grant execute on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text) to authenticated;
+grant execute on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) to authenticated;
+grant execute on function public.set_profile_active(uuid,boolean) to authenticated;
+grant execute on function public.set_minimum_coverage(integer) to authenticated;
+grant execute on function public.rollover_leave_year() to authenticated;
 grant execute on function public.submit_leave(uuid,date,date,text,text,numeric) to authenticated;
 grant execute on function public.update_leave(uuid,date,date,text,text,numeric) to authenticated;
 grant execute on function public.decide_leave(uuid,text,text,boolean) to authenticated;
 grant execute on function public.cancel_leave(uuid) to authenticated;
 grant execute on function public.mark_notifications_read() to authenticated;
-grant execute on function public.upsert_holiday(date,text) to authenticated;
+grant execute on function public.upsert_holiday(date,text,text) to authenticated;
+grant execute on function public.delete_holiday(date) to authenticated;
 
 grant select on public.holidays to authenticated;
+grant select on public.team_settings to authenticated;
 grant select, update on public.notifications to authenticated;

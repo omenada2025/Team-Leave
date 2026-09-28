@@ -11,13 +11,30 @@ concurrency:
   group: pages
   cancel-in-progress: true
 jobs:
+  # Pages must not deploy until the same checks as CI pass.
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build dist from src
+        run: bash scripts/build.sh
+      - name: Leave balance & coverage logic
+        run: node scripts/test-logic.mjs
+      - name: SQL source checks
+        run: node scripts/test-sql.mjs
   deploy:
+    needs: verify
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+      - name: Build dist from src
+        run: bash scripts/build.sh
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:

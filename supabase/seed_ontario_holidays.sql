@@ -1,4 +1,3 @@
--- Alias of seed_ontario_holidays.sql (kept for older docs).
 -- Ontario ESA public holidays (2026–2028).
 -- Run after schema.sql (fresh) or upgrade_workflow.sql (existing) when holidays are missing,
 -- or use “Load Ontario holidays” in the Reports page (managers).
