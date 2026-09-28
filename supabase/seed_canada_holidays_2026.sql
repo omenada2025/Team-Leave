@@ -1,4 +1,5 @@
 -- Ontario Employment Standards Act public holidays for 2026.
+-- Run after schema.sql (fresh) or upgrade_workflow.sql (existing) when holidays are missing.
 delete from public.holidays where region = 'Canada — Federal';
 insert into public.holidays(date,name,region) values
   ('2026-01-01','New Year''s Day','Ontario'),

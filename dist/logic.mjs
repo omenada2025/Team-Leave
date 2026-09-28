@@ -22,7 +22,8 @@ export function businessDates(start, end) {
 }
 export const businessDays = (start, end) => businessDates(start, end).length;
 export const requestDuration = r => businessDays(r.start,r.end)*(Number(r.portion)||1);
-export const balanceDuration = r => r.type==='Work From Home'?0:requestDuration(r);
+// Only Vacation burns annual vacation days. profiles.used is carry-in / manual only.
+export const balanceDuration = r => r.type==='Vacation'?requestDuration(r):0;
 export function sampleRequests(today = new Date()) {
   const day = n => iso(addBusinessDays(today,n));
   return [
@@ -59,6 +60,6 @@ export function validateRequest({start,end,person,type='Vacation',portion=1,excl
   const days = businessDays(start,end)*Number(portion);
   if (!days) return 'Select at least one weekday.';
   if (requests.some(r=>r.id!==excludeId && r.person===person && r.status!=='declined' && r.status!=='cancelled' && r.start<=end && r.end>=start)) return 'You already have a request on these dates.';
-  if (type!=='Work From Home' && days>remaining(person,requests).available) return 'This request exceeds the available balance.';
+  if (type==='Vacation' && days>remaining(person,requests).available) return 'This request exceeds the available balance.';
   return null;
 }
