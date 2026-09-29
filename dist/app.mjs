@@ -79,29 +79,34 @@ function hydrate(data) {
 }
 
 async function loadState() {
+  const profileSelect = await supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email,active').order('name');
+  // Fallback if upgrade has not added profiles.active yet.
+  const profilesRes = profileSelect.error && /active/i.test(profileSelect.error.message)
+    ? await supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email').order('name')
+    : profileSelect;
   const [
-    {data:profiles, error:peopleError},
     {data:leave, error:requestError},
     {data:holidayData},
     {data:noticeRows},
-    {data:settingsRows}
+    settingsRes
   ] = await Promise.all([
-    supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email,active').order('name'),
     supabase.from('leave_requests').select('id,person,start,end,type,portion,status,note,decision_note,submitted,decided,decided_by').order('submitted', {ascending:false}),
     supabase.from('holidays').select('date,name,region').order('date'),
     supabase.from('notifications').select('id,title,message,read,created_at').order('created_at', {ascending:false}).limit(25),
     supabase.from('team_settings').select('minimum_coverage').eq('id', 1).maybeSingle()
   ]);
+  const peopleError = profilesRes.error;
+  const profiles = (profilesRes.data || []).map(p => ({...p, active: p.active !== false}));
   if (peopleError || requestError) throw Error(peopleError?.message || requestError?.message);
   const email = session.user.email.toLowerCase();
-  const current = (profiles || []).find(p => p.email.toLowerCase() === email);
+  const current = profiles.find(p => p.email.toLowerCase() === email);
   if (!current) throw Error('Your account has not been added to this team. Ask the manager to add your email address.');
   if (current.active === false) throw Error('Your account is deactivated. Ask a manager to reactivate you.');
-  const configured = settingsRows?.minimum_coverage ?? null;
-  const activeCount = (profiles || []).filter(p => p.active !== false).length;
+  const configured = settingsRes.error ? null : (settingsRes.data?.minimum_coverage ?? null);
+  const activeCount = profiles.filter(p => p.active !== false).length;
   const min = configured != null ? configured : Math.max(1, activeCount - 2);
   hydrate({
-    people: profiles || [],
+    people: profiles,
     requests: (leave || []).map(r => ({...r, decisionNote: r.decision_note || ''})),
     holidays: holidayData || [],
     notifications: noticeRows || [],

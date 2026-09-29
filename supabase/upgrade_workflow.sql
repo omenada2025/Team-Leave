@@ -66,6 +66,7 @@ language sql stable security definer set search_path=public as $$
   select exists(select 1 from profiles where id=current_profile_id() and role='manager' and active)
 $$;
 
+-- Never true for self (align with decide_leave + UI managesPerson).
 create or replace function public.manages_person(p_person uuid) returns boolean
 language sql stable security definer set search_path=public as $$
   select exists(
@@ -73,6 +74,7 @@ language sql stable security definer set search_path=public as $$
     from profiles me
     join profiles them on them.id = p_person
     where me.id = current_profile_id()
+      and me.id <> p_person
       and me.role = 'manager'
       and me.active
       and (

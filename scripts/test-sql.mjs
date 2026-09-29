@@ -20,6 +20,7 @@ const upgrade = readFileSync(join(dir, 'upgrade_workflow.sql'), 'utf8');
 for (const [label, sql] of [['schema', schema], ['upgrade', upgrade]]) {
   assert(`${label}: no email_events writes`, !/insert into\s+email_events/i.test(sql));
   assert(`${label}: manages_person exists`, /create or replace function public\.manages_person/i.test(sql));
+  assert(`${label}: manages_person excludes self`, /me\.id\s*<>\s*p_person/.test(sql));
   assert(`${label}: decide_leave team scope`, /you can only decide requests for your team/i.test(sql));
   assert(`${label}: delete_holiday`, /create or replace function public\.delete_holiday/i.test(sql));
   assert(`${label}: set_minimum_coverage`, /create or replace function public\.set_minimum_coverage/i.test(sql));
