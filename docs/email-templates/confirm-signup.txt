@@ -1,0 +1,13 @@
+Team Leave — Confirm your email
+
+Someone started a Team Leave account with this email address
+(https://omenada2025.github.io/Team-Leave/).
+
+Confirm your email with this link (opens a secure Supabase page, then returns you to Team Leave):
+
+{{ .ConfirmationURL }}
+
+If you did not expect this, you can ignore this email. No Team Leave account will be activated for you.
+
+— Team Leave · Daniela’s team (Zenatech)
+App: {{ .SiteURL }}

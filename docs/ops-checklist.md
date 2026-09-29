@@ -19,6 +19,10 @@ These steps cannot be completed from the GitHub repo alone. Do them in the Supab
 
 Also: **Authentication → Email Templates → Reset password** must keep `{{ .ConfirmationURL }}`.
 
+### Set Auth email templates (subjects + Team Leave branding)
+
+Paste product-named subjects and HTML from [`docs/email-templates/`](email-templates/README.md) (start with **Reset password**: subject `Team Leave — Reset your password`). Full paste guide: [Email Templates](https://supabase.com/dashboard/project/skezxxnhsvdrwrdxabje/auth/templates). Optional Custom SMTP sender display name: **`Team Leave`**.
+
 Why `?reset=1` + implicit flow: admin-sent resets open on the employee’s device; PKCE would bind the link to Daniela’s browser.
 
 ### Auth settings for temporary passwords
@@ -85,6 +89,7 @@ group by p.id order by p.email;
 ## E. 10-minute smoke after each merge to `main`
 
 - [ ] Auth URLs match section A
+- [ ] Email templates: Reset password subject starts with **Team Leave —** (see `docs/email-templates/`)
 - [ ] SQL: `must_change_password` column + RPCs applied
 - [ ] Users → Add user → mailto shows **temporary password**
 - [ ] Sign in with temp password → blocked until **Choose a new password**

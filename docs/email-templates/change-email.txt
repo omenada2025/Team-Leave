@@ -1,0 +1,13 @@
+Team Leave — Confirm your new email
+
+A request was made to change the email address on a Team Leave account
+(https://omenada2025.github.io/Team-Leave/).
+
+Confirm this address with this link (opens a secure Supabase page, then returns you to Team Leave):
+
+{{ .ConfirmationURL }}
+
+If you did not request an email change, you can ignore this message. Your current email stays in place until confirmed.
+
+— Team Leave · Daniela’s team (Zenatech)
+App: {{ .SiteURL }}

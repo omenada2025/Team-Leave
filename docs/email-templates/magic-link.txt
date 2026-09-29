@@ -1,0 +1,13 @@
+Team Leave — Your sign-in link
+
+Use this one-time link to sign in to Team Leave
+(https://omenada2025.github.io/Team-Leave/).
+
+Open this link (secure Supabase page, then returns you to Team Leave):
+
+{{ .ConfirmationURL }}
+
+If you did not ask to sign in, you can ignore this email.
+
+— Team Leave · Daniela’s team (Zenatech)
+App: {{ .SiteURL }}
