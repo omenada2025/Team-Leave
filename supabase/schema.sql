@@ -15,7 +15,9 @@ create table if not exists public.profiles (
   role text not null default 'employee' check (role in ('employee','manager','admin')),
   team text not null default 'General',
   manager_email text,
-  active boolean not null default true
+  active boolean not null default true,
+  -- True after admin creates / re-invites with a temporary password; cleared after first change.
+  must_change_password boolean not null default false
 );
 
 create table if not exists public.leave_requests (
@@ -113,8 +115,7 @@ language sql stable security definer set search_path=public as $$
   )
 $$;
 
--- Allows the login "Create password" tab to confirm the email was added by a manager
--- before calling Auth signup. Returns boolean only (no profile data). Inactive = not invited.
+-- Active team member check (Forgot password). Returns boolean only. Inactive = not invited.
 create or replace function public.is_invited_email(p_email text) returns boolean
 language sql stable security definer set search_path=public as $$
   select exists(select 1 from profiles where lower(email)=lower(trim(p_email)) and active)
@@ -269,7 +270,7 @@ begin
       active = coalesce(p_active, active)
     where id = p_id returning id into v_id;
   else
-    insert into profiles(email,name,allowance,used,role,team,manager_email,active)
+    insert into profiles(email,name,allowance,used,role,team,manager_email,active,must_change_password)
     values(
       lower(trim(p_email)),
       trim(p_name),
@@ -278,17 +279,36 @@ begin
       p_role,
       coalesce(nullif(trim(p_team),''),'General'),
       nullif(lower(trim(p_manager_email)),''),
-      coalesce(p_active, true)
+      coalesce(p_active, true),
+      true
     )
     on conflict(email) do update set
       name = excluded.name,
       allowance = excluded.allowance,
       team = excluded.team,
       manager_email = excluded.manager_email,
-      active = true
+      active = true,
+      must_change_password = true
     returning id into v_id;
   end if;
   return v_id;
+end $$;
+
+create or replace function public.clear_must_change_password()
+returns void language plpgsql security definer set search_path=public as $$
+begin
+  update profiles
+  set must_change_password = false
+  where id = current_profile_id();
+  if not found then raise exception 'Profile not found.'; end if;
+end $$;
+
+create or replace function public.set_must_change_password(p_id uuid, p_value boolean default true)
+returns void language plpgsql security definer set search_path=public as $$
+begin
+  if not is_admin() then raise exception 'Admin access required.'; end if;
+  update profiles set must_change_password = coalesce(p_value, true) where id = p_id;
+  if not found then raise exception 'User not found.'; end if;
 end $$;
 
 create or replace function public.set_profile_active(p_id uuid, p_active boolean)
@@ -555,6 +575,8 @@ end $$;
 revoke all on function public.is_invited_email(text) from public;
 revoke all on function public.is_admin() from public;
 revoke all on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) from public,anon;
+revoke all on function public.clear_must_change_password() from public,anon;
+revoke all on function public.set_must_change_password(uuid,boolean) from public,anon;
 revoke all on function public.set_profile_active(uuid,boolean) from public,anon;
 revoke all on function public.set_minimum_coverage(integer) from public,anon;
 revoke all on function public.rollover_leave_year() from public,anon;
@@ -568,7 +590,10 @@ revoke all on function public.upsert_holiday(date,text,text) from public,anon;
 revoke all on function public.delete_holiday(date) from public,anon;
 
 grant execute on function public.is_invited_email(text) to anon, authenticated;
+grant execute on function public.is_admin() to authenticated;
 grant execute on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) to authenticated;
+grant execute on function public.clear_must_change_password() to authenticated;
+grant execute on function public.set_must_change_password(uuid,boolean) to authenticated;
 grant execute on function public.set_profile_active(uuid,boolean) to authenticated;
 grant execute on function public.set_minimum_coverage(integer) to authenticated;
 grant execute on function public.rollover_leave_year() to authenticated;
