@@ -33,6 +33,10 @@ let passwordRecovery = false;
 let recoveryError = '';
 /** Brief success screen after Save new password. */
 let passwordSavedOk = false;
+/** True when profile.must_change_password — block app until they set a new password. */
+let mustChangePassword = false;
+/** Suppress auth state churn while admin provisions a teammate Auth user. */
+let provisioningAuth = false;
 let role = 'employee', view = 'overview', modal = null;
 let requestFilter = 'all';
 let userListFilter = 'all';
@@ -46,14 +50,83 @@ let selectedDay = iso(new Date());
 let lastFocusEl = null;
 let realtimeChannel = null;
 let pollTimer = null;
-const inviteLink = (email) => {
-  const base = location.href.split(/[?#]/)[0];
-  return email ? `${base}?email=${encodeURIComponent(email)}` : base;
-};
-const readInviteEmail = () => {
+const inviteLink = () => location.href.split(/[?#]/)[0];
+const readPrefillEmail = () => {
   try { return (new URLSearchParams(location.search || '').get('email') || '').trim().toLowerCase(); }
   catch (_) { return ''; }
 };
+/** Cryptographically random temporary password (never commit or log). */
+const generateTempPassword = () => {
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz23456789!@$%';
+  const bytes = new Uint8Array(14);
+  crypto.getRandomValues(bytes);
+  let out = '';
+  for (const b of bytes) out += alphabet[b % alphabet.length];
+  return `${out}Aa1!`;
+};
+const accessEmailBody = (email, password) =>
+  `You have been added to Team Leave.\n\n` +
+  `1. Open: ${inviteLink()}\n` +
+  `2. Sign in with:\n` +
+  `   Email: ${email}\n` +
+  `   Temporary password: ${password}\n` +
+  `3. You will be asked to choose a new password before using the app.\n\n` +
+  `Do not forward this email. If you did not expect access, tell your admin.`;
+
+/**
+ * Create or reset Auth user with a temp password.
+ * Prefer Edge Function (service role). Fallback: signUp + restore admin session + mailto.
+ */
+async function provisionAuthUser(email, name, tempPassword) {
+  const { data: fnData, error: fnError } = await supabase.functions.invoke('admin-create-user', {
+    body: { email, name, password: tempPassword }
+  });
+  if (!fnError && fnData?.ok && fnData.password) {
+    return { password: fnData.password, method: 'edge', created: !!fnData.created };
+  }
+  const fnMsg = fnData?.error || fnError?.message || '';
+  // Fallback when the Edge Function is not deployed yet.
+  const { data: sessWrap } = await supabase.auth.getSession();
+  const adminSession = sessWrap?.session;
+  if (!adminSession?.access_token || !adminSession?.refresh_token) {
+    throw Error(fnMsg || 'Admin session required to create Auth users. Deploy admin-create-user or stay signed in.');
+  }
+  provisioningAuth = true;
+  try {
+    const { data: signData, error: signError } = await supabase.auth.signUp({
+      email,
+      password: tempPassword,
+      options: { data: name ? { full_name: name } : undefined }
+    });
+    // Always restore the admin session — signUp may have replaced it.
+    const { error: restoreError } = await supabase.auth.setSession({
+      access_token: adminSession.access_token,
+      refresh_token: adminSession.refresh_token
+    });
+    if (restoreError) {
+      throw Error(`Auth user may have been created, but restoring your admin session failed: ${restoreError.message}. Sign in again.`);
+    }
+    session = (await supabase.auth.getSession()).data.session;
+    if (signError) {
+      const msg = signError.message || '';
+      if (/already\s+(been\s+)?registered|already exists|user already/i.test(msg)) {
+        throw Error(
+          `Auth user already exists for ${email}. Use Edit → Reset password, or deploy the admin-create-user Edge Function to regenerate a temporary password. (${fnMsg || 'Edge Function unavailable'})`
+        );
+      }
+      throw Error(fnMsg ? `${fnMsg} Fallback signUp failed: ${msg}` : msg);
+    }
+    const needsConfirm = !signData?.session && signData?.user && !signData.user.email_confirmed_at;
+    return {
+      password: tempPassword,
+      method: 'signup',
+      created: true,
+      needsConfirm: !!needsConfirm
+    };
+  } finally {
+    provisioningAuth = false;
+  }
+}
 const isAdmin = () => role === 'admin';
 const isManagerRole = () => role === 'manager' || role === 'admin';
 const roleLabel = r => r === 'admin' ? 'Admin' : r === 'manager' ? 'Manager' : 'Employee';
@@ -120,11 +193,15 @@ function hydrate(data) {
 }
 
 async function loadState() {
-  const profileSelect = await supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email,active').order('name');
-  // Fallback if upgrade has not added profiles.active yet.
-  const profilesRes = profileSelect.error && /active/i.test(profileSelect.error.message)
-    ? await supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email').order('name')
-    : profileSelect;
+  const profileSelect = await supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email,active,must_change_password').order('name');
+  // Fallback if upgrade has not added newer columns yet.
+  let profilesRes = profileSelect;
+  if (profileSelect.error && /must_change_password/i.test(profileSelect.error.message || '')) {
+    profilesRes = await supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email,active').order('name');
+  }
+  if (profilesRes.error && /active/i.test(profilesRes.error.message || '')) {
+    profilesRes = await supabase.from('profiles').select('id,email,name,allowance,used,role,team,manager_email').order('name');
+  }
   const [
     {data:leave, error:requestError},
     {data:holidayData},
@@ -147,12 +224,17 @@ async function loadState() {
     settingsData = fallback.data;
   }
   const peopleError = profilesRes.error;
-  const profiles = (profilesRes.data || []).map(p => ({...p, active: p.active !== false}));
+  const profiles = (profilesRes.data || []).map(p => ({
+    ...p,
+    active: p.active !== false,
+    must_change_password: !!p.must_change_password
+  }));
   if (peopleError || requestError) throw Error(peopleError?.message || requestError?.message);
   const email = session.user.email.toLowerCase();
   const current = profiles.find(p => p.email.toLowerCase() === email);
   if (!current) throw Error('Your account has not been added to this team. Ask an admin to add your email address.');
   if (current.active === false) throw Error('Your account is deactivated. Ask an admin to reactivate you.');
+  mustChangePassword = !!current.must_change_password;
   const configured = settingsData?.minimum_coverage ?? null;
   lastRolloverAt = settingsData?.last_rollover_at || null;
   const activeCount = profiles.filter(p => p.active !== false).length;
@@ -254,8 +336,6 @@ async function establishSessionFromUrl() {
 
 async function load() {
   try {
-    const inviteEmail = readInviteEmail();
-    if (inviteEmail && !session) authMode = 'signup';
     if (hasRecoveryIntent()) passwordRecovery = true;
     session = await establishSessionFromUrl();
     if (parseAuthUrl().hasAuthPayload || parseAuthUrl().looksRecovery) scrubAuthParamsFromUrl();
@@ -264,7 +344,7 @@ async function load() {
       catch (e) { loadError = e.message; }
     } else if (session && !passwordRecovery) {
       await loadState();
-      startLive();
+      if (!mustChangePassword) startLive();
     } else if (passwordRecovery && !session && !recoveryError) {
       recoveryError = 'This reset link is missing its login tokens. Request a new password reset email and open it on this device.';
     }
@@ -461,22 +541,30 @@ function usersPage() {
     const awaiting = p.active !== false && (p.id in authStatusById) && !authStatusById[p.id];
     return `<div class="userrow ${p.active === false ? 'inactive' : ''}">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email || '')} · ${escapeHtml(p.team || 'General')}${p.active === false ? ' · Deactivated' : ''}</span>${authBadge(p)}</div><span class="userrole">${roleLabel(p.role)}</span><span class="userbalance"><b>${remaining(p.id, requests).available}</b> days available</span><div class="useractions">${awaiting ? `<button class="rowaction" data-resendinvite="${p.id}">Resend invite</button>` : ''}<button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button></div></div>`;
   }).join('') || '<div class="empty">No users match this filter.</div>'}</div></section>
-  <p class="userhint">Adding a user creates their team profile only (role starts as Employee — promote later in Edit). Share the invite link with <code>?email=</code> so Create password is prefilled. Deactivating keeps leave history and blocks Create password / sign-in. Auth status badges need the live SQL upgrade (<code>list_profile_auth_status</code>).</p>`;
+  <p class="userhint">Adding a user creates their team profile <b>and</b> an Auth account with a temporary password (role starts as Employee — promote later in Edit). Email them the temp password (Open email / Copy). They must set a new password on first sign-in. Deactivating keeps leave history and blocks sign-in. Auth status badges need the live SQL upgrade (<code>list_profile_auth_status</code>).</p>`;
 }
 
 function renderModal() {
   if (modal.kind === 'invite') {
-    const link = inviteLink(modal.email);
-    const body = `You have been added to Team Leave.\n\n1. Open: ${link}\n2. Choose Create password (or Sign in if you already have an account)\n3. Your email is prefilled: ${modal.email}\n\nCreate your own password — none is shared by email.`;
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PROFILE READY</div><h2>Invite them to create a password</h2><p class="dialoglead">Their work email is on the team. Share the invite link (email is prefilled). They create their own password. No temporary password is generated.</p><div class="requestnote"><span>ACCESS LINK</span><p>${escapeHtml(link)}</p><span>EMAIL</span><p>${escapeHtml(modal.email)}</p></div><div class="dialogactions"><button class="secondary" data-copy-invite="${encodeURIComponent(body)}">Copy invite</button><a class="primary mailbutton" href="mailto:${encodeURIComponent(modal.email)}?subject=${encodeURIComponent('Your Team Leave access')}&body=${encodeURIComponent(body)}">Open email</a><button class="primary" data-action="close">Done</button></div></div></div>`;
+    const password = modal.password || '';
+    const body = accessEmailBody(modal.email, password || '(ask your admin for the temporary password)');
+    const methodNote = modal.method === 'edge'
+      ? 'Auth user created via Edge Function (email confirmed).'
+      : modal.method === 'signup'
+        ? 'Auth user created via client signUp (MVP). Prefer deploying admin-create-user for production.'
+        : '';
+    const confirmNote = modal.needsConfirm
+      ? '<div class="warnbox" role="status"><b>Email confirmation may be required</b><p>If they cannot sign in, turn off Confirm email in Supabase Auth, or deploy the Edge Function (auto-confirms).</p></div>'
+      : '';
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ACCESS READY</div><h2>Email their temporary password</h2><p class="dialoglead">Profile and Auth account are ready. Send the temporary password now — they must change it on first sign-in.</p><div class="requestnote"><span>EMAIL</span><p>${escapeHtml(modal.email)}</p><span>TEMPORARY PASSWORD</span><p><code>${escapeHtml(password)}</code></p><span>APP LINK</span><p>${escapeHtml(inviteLink())}</p></div>${confirmNote}${methodNote ? `<p class="quiet">${escapeHtml(methodNote)}</p>` : ''}<div class="dialogactions"><button class="secondary" data-copy-invite="${encodeURIComponent(body)}">Copy email</button><a class="primary mailbutton" href="mailto:${encodeURIComponent(modal.email)}?subject=${encodeURIComponent('Your Team Leave access')}&body=${encodeURIComponent(body)}">Open email</a><button class="primary" data-action="close">Done</button></div></div></div>`;
   }
   if (modal.kind === 'help') {
     return `<div class="scrim" data-action="close"><div class="dialog dialogwide" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ONBOARDING</div><h2>How Team Leave access works</h2><p class="dialoglead">English checklist for first-time access and password resets.</p>
     <ol class="checklist">
-      <li><b>Admin adds</b> the person on Users → Add user (profile only, starts as Employee).</li>
-      <li><b>Share the invite link</b> (Copy invite / Open email). The link includes <code>?email=</code> so Create password is prefilled.</li>
-      <li>They open the app → <b>Create password</b> → then <b>Sign in</b>.</li>
-      <li><b>Forgot password</b> only works after they already created a password once. New invites use Create password, not Forgot.</li>
+      <li><b>Admin adds</b> the person on Users → Add user (profile + Auth user with a temporary password; starts as Employee).</li>
+      <li><b>Email the temporary password</b> (Open email / Copy). They sign in with that password.</li>
+      <li>On first sign-in they <b>must set a new password</b> before using the app.</li>
+      <li><b>Forgot password</b> / admin <b>Reset password</b> send a recovery link (separate from first-login force-change).</li>
       <li>If a reset email opens Sign in with no set-password screen, Auth URL Configuration in Supabase is wrong (see README / ops checklist).</li>
       <li>Deactivated accounts: ask an <b>admin</b> to reactivate — managers cannot do this.</li>
       <li>Managers: open <b>Requests</b> each morning. Notifications are in-app only (no email alerts).</li>
@@ -486,7 +574,7 @@ function renderModal() {
   if (modal.kind === 'password') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ACCOUNT SECURITY</div><h2>Change password</h2><p class="dialoglead">Use at least 8 characters. Your current session will stay signed in.</p><form id="passwordform"><label>New password<input name="password" type="password" minlength="8" autocomplete="new-password" required></label><label>Confirm password<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required></label><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Update password</button></div></form></div></div>`;
   if (modal.kind === 'resetconfirm') {
     const p = person(modal.id); if (!p) return '';
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PASSWORD RESET</div><h2>Send reset email?</h2><p class="dialoglead">Supabase will email a one-time link to this address. No temporary password is created.</p><div class="requestnote"><span>EMAIL</span><p>${escapeHtml(p.email)}</p></div><div class="requestnote"><span>REQUIREMENT</span><p>They must already have used Create password once. If they were only invited and never set a password, share the invite link and ask them to use Create password instead.</p></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="backtoedituser">Back</button><button type="button" class="primary" data-action="confirmreset">Send reset email</button></div></div></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PASSWORD RESET</div><h2>Send reset email?</h2><p class="dialoglead">Supabase will email a one-time recovery link. This is separate from the first-login temporary password flow.</p><div class="requestnote"><span>EMAIL</span><p>${escapeHtml(p.email)}</p></div><div class="requestnote"><span>NOTE</span><p>They must already have an Auth account. New teammates get a temporary password when you Add user (or Resend invite).</p></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="backtoedituser">Back</button><button type="button" class="primary" data-action="confirmreset">Send reset email</button></div></div></div>`;
   }
   if (modal.kind === 'notifications') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">UPDATES</div><h2>Notifications</h2><p class="dialoglead">In-app only — Team Leave does not send email. Tap an item to open the related request when available.</p><div class="notificationlist">${notifications.length ? notifications.map(n => `<button type="button" class="notification ${n.read ? '' : 'unread'}" data-open-notice="${n.id}" ${n.requestId ? `data-request="${n.requestId}"` : ''}><b>${escapeHtml(n.title)}</b><p>${escapeHtml(n.message)}</p><time>${new Date(n.created_at).toLocaleString('en-CA', {dateStyle:'medium', timeStyle:'short'})}</time></button>`).join('') : '<div class="empty">You are all caught up.</div>'}</div></div></div>`;
   if (modal.kind === 'manageholidays') {
@@ -508,9 +596,9 @@ function renderModal() {
         ? `<div class="formerror" id="resetfeedback" role="alert">${escapeHtml(modal.resetError)}</div>`
         : `<div id="resetfeedback"></div>`;
     const awaiting = p.active !== false && (p.id in authStatusById) && !authStatusById[p.id];
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">Update role, team, leave balance, or send a password reset link.${authBadge(p) ? ` ${authBadge(p)}` : ''}</p><form id="edituserform"><label>Email<input type="email" value="${escapeHtml(p.email || '')}" readonly tabindex="-1" aria-readonly="true"></label><p class="quiet">Email matches their Auth account and cannot be changed here.</p><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option><option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Admin</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${awaiting ? `<p class="quiet">This person has never signed in — use Resend invite from the Users list, not Reset password.</p>` : ''}${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">Update role, team, leave balance, or send a password reset link.${authBadge(p) ? ` ${authBadge(p)}` : ''}</p><form id="edituserform"><label>Email<input type="email" value="${escapeHtml(p.email || '')}" readonly tabindex="-1" aria-readonly="true"></label><p class="quiet">Email matches their Auth account and cannot be changed here.</p><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option><option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Admin</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${awaiting ? `<p class="quiet">No Auth account yet — use <b>Resend invite</b> on the Users list to create one and email a temporary password.</p>` : ''}${p.must_change_password ? `<p class="quiet">This user must change their temporary password on next sign-in.</p>` : ''}${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
   }
-  if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create their team profile (starts as Employee — you can promote them to Manager or Admin later in Edit). They create their own password from the sign-in page.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
+  if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Creates their team profile and Auth account with a temporary password (starts as Employee — promote later in Edit). You will email them the temp password; they must change it on first sign-in.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
   if (modal.kind === 'new' || modal.kind === 'editrequest') {
     const editing = modal.kind === 'editrequest', current = editing ? requests.find(x => x.id === modal.id) : null;
     if (editing && !current) return '';
@@ -532,7 +620,13 @@ function renderModal() {
   const risk = riskFor(r), b = remaining(r.person, requests);
   const reviewDays = requestDuration(r), burn = balanceDuration(r);
   const head = activePeople().length;
-  return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">MANAGER DECISION</div><h2 id="dialog-title">Review time off</h2><div class="reviewperson">${avatar(person(r.person))}<div><b>${escapeHtml(person(r.person)?.name || '')}</b><span>${typeLabel(r)} · ${range(r)} · ${daysLabel(reviewDays)}</span></div>${badge(r.status)}</div><div class="reviewfacts"><div><span>Balance after approval</span><b>${b.available - burn} days</b></div><div><span>Coverage impact</span><b class="${risk.length ? 'dangertext' : ''}">${risk.length ? `${daysLabel(risk.length)} below minimum` : 'No conflict'}</b></div></div>${risk.length ? `<div class="warnbox"><b>⚠ Coverage conflict</b><p>Approving this request leaves ${risk[0].available} of ${head} people available on ${risk.map(x => pretty(x.date)).join(', ')}. Your minimum is ${minimumCoverage}.</p></div>` : '<div class="okbox">✓ Team coverage meets the minimum for these dates.</div>'}${r.note ? `<div class="requestnote"><span>EMPLOYEE NOTE</span><p>${escapeHtml(r.note)}</p></div>` : ''}<form id="decisionform"><label>Decision note <span class="optional">${risk.length ? 'Required when overriding coverage' : 'Required to decline'}</span><textarea name="decisionNote" maxlength="500" placeholder="${risk.length ? 'Briefly note how coverage is arranged' : 'Add context for the employee'}"></textarea></label>${risk.length ? `<label class="checkline"><input type="checkbox" name="override" id="overrideCoverage"> I’ve arranged coverage and want to approve anyway.</label>` : ''}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" name="decision" value="declined" class="declinebutton">Decline</button><button type="submit" name="decision" value="approved" class="primary" ${risk.length ? 'disabled' : ''} id="approveBtn">Approve →</button></div></form></div></div>`;
+  const coverageDays = r.type === 'Work From Home' ? [] : coverageFor(r.start, r.end, requests, r.person, r.id);
+  const alreadyAway = [...new Set(coverageDays.flatMap(d => d.approved.filter(id => id !== r.person)))];
+  const awayNames = alreadyAway.map(id => person(id)?.name).filter(Boolean);
+  const awayNote = awayNames.length
+    ? `<p class="quiet">Already away on overlapping days: ${awayNames.map(n => escapeHtml(n)).join(', ')}.</p>`
+    : '';
+  return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">MANAGER DECISION</div><h2 id="dialog-title">Review time off</h2><div class="reviewperson">${avatar(person(r.person))}<div><b>${escapeHtml(person(r.person)?.name || '')}</b><span>${typeLabel(r)} · ${range(r)} · ${daysLabel(reviewDays)}</span></div>${badge(r.status)}</div><div class="reviewfacts"><div><span>Balance after approval</span><b>${b.available - burn} days</b></div><div><span>Coverage impact</span><b class="${risk.length ? 'dangertext' : ''}">${risk.length ? `${daysLabel(risk.length)} below minimum` : 'No conflict'}</b></div></div>${risk.length ? `<div class="warnbox"><b>⚠ Coverage conflict</b><p>Approving this request leaves ${risk[0].available} of ${head} people available on ${risk.map(x => pretty(x.date)).join(', ')}. Your minimum is ${minimumCoverage}.</p>${awayNote}</div>` : `<div class="okbox">✓ Team coverage meets the minimum for these dates.</div>${awayNote}`}${r.note ? `<div class="requestnote"><span>EMPLOYEE NOTE</span><p>${escapeHtml(r.note)}</p></div>` : ''}<form id="decisionform"><label>Decision note <span class="optional">${risk.length ? 'Required when overriding coverage' : 'Required to decline'}</span><textarea name="decisionNote" maxlength="500" placeholder="${risk.length ? 'Briefly note how coverage is arranged' : 'Add context for the employee'}"></textarea></label>${risk.length ? `<label class="checkline"><input type="checkbox" name="override" id="overrideCoverage"> I’ve arranged coverage and want to approve anyway.</label>` : ''}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" name="decision" value="declined" class="declinebutton">Decline</button><button type="submit" name="decision" value="approved" class="primary" ${risk.length ? 'disabled' : ''} id="approveBtn">Approve →</button></div></form></div></div>`;
 }
 
 function renderRecovery() {
@@ -548,22 +642,31 @@ function renderRecovery() {
   return `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PASSWORD RESET</div><h1>Could not open reset link</h1><p>Team Leave needs a valid reset link to let you set a new password. You should not use Sign in with the old password here.</p><div class="warnbox" role="alert"><b>What happened</b><p>${escapeHtml(detail)}</p></div><button class="primary" data-action="cancelrecovery">Back to sign in</button><button class="loginlink" data-auth-mode="forgot">Request a new reset email</button><p class="loginhelp">Tip: use the latest email only. Links expire. Admin-sent resets open on any device after this fix.</p></section></main>`;
 }
 
+function renderForceChange() {
+  const email = session?.user?.email || '';
+  return `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">SECURITY</div><h1>Choose a new password</h1><p>You signed in with a temporary password. Set a new password to continue — this is required once.</p><form id="forcechangepasswordform"><label>Email<input type="email" value="${escapeHtml(email)}" readonly tabindex="-1" aria-readonly="true"></label><label>New password<input name="password" type="password" minlength="8" autocomplete="new-password" required placeholder="At least 8 characters"></label><label>Confirm password<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required placeholder="Repeat your password"></label><div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">Save and continue</button></form><button class="loginlink" data-action="signout">Sign out</button></section></main>`;
+}
+
 function render() {
   if (loading) { app.innerHTML = '<main class="main"><h1>Loading team leave…</h1></main>'; return; }
   if (passwordSavedOk && session) {
     app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PASSWORD SAVED</div><h1>You're ready</h1><p>Your new password is saved. Continue to the workspace, or sign out if this is not your device.</p>${loadError ? `<div class="warnbox" role="status"><b>Note</b><p>${escapeHtml(loadError)}</p></div>` : ''}<button class="primary" data-action="enterworkspace">Continue to workspace</button><button class="loginlink" data-action="signout">Sign out</button></section></main>`;
     return;
   }
-  // Never show Sign in / Create password while a recovery link (or intent) is active.
+  // Never show Sign in while a recovery link (or intent) is active.
   if (passwordRecovery || hasRecoveryIntent()) {
     passwordRecovery = true;
     app.innerHTML = renderRecovery();
     return;
   }
   if (!session) {
-    const creating = authMode === 'signup', forgot = authMode === 'forgot';
-    const prefill = readInviteEmail();
-    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>${forgot ? 'Enter your work email. If you already created a password, we send a reset link. If you were invited and never set one, use Create password instead.' : creating ? 'Create a password for your invited work email.' : 'Sign in with your work email and password.'}</p>${forgot ? '' : `<div class="authtabs" role="tablist" aria-label="Account access"><button type="button" role="tab" aria-selected="${!creating}" class="${!creating ? 'active' : ''}" data-auth-mode="signin">Sign in</button><button type="button" role="tab" aria-selected="${creating}" class="${creating ? 'active' : ''}" data-auth-mode="signup">Create password</button></div>`}<form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com" value="${escapeHtml(prefill)}"></label>${forgot ? '' : `<label>Password<input name="password" type="password" autocomplete="${creating ? 'new-password' : 'current-password'}" minlength="8" required placeholder="At least 8 characters"></label>${creating ? '<label>Confirm password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="Repeat your password"></label>' : ''}`}<div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">${forgot ? 'Send reset link' : creating ? 'Create password' : 'Sign in'}</button></form>${forgot ? '<button class="loginlink" data-auth-mode="signup">Never created a password? Create password</button><button class="loginlink" data-auth-mode="signin">← Back to sign in</button>' : '<button class="loginlink" data-auth-mode="forgot">Forgot password?</button>'}<p class="loginhelp">Access is limited to email addresses already added by an admin. Deactivated accounts cannot sign in — ask an <b>admin</b> to reactivate. Notifications are in-app only.</p></section></main>`;
+    const forgot = authMode === 'forgot';
+    const prefill = readPrefillEmail();
+    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>${forgot ? 'Enter your work email. If you already have an account, we send a password reset link.' : 'Sign in with your work email and password. New teammates receive a temporary password from an admin.'}</p><form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com" value="${escapeHtml(prefill)}"></label>${forgot ? '' : `<label>Password<input name="password" type="password" autocomplete="current-password" minlength="8" required placeholder="At least 8 characters"></label>`}<div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">${forgot ? 'Send reset link' : 'Sign in'}</button></form>${forgot ? '<button class="loginlink" data-auth-mode="signin">← Back to sign in</button>' : '<button class="loginlink" data-auth-mode="forgot">Forgot password?</button>'}<p class="loginhelp">Access is limited to people added by an admin. Deactivated accounts cannot sign in — ask an <b>admin</b> to reactivate. Notifications are in-app only.</p></section></main>`;
+    return;
+  }
+  if (mustChangePassword && !passwordRecovery) {
+    app.innerHTML = renderForceChange();
     return;
   }
   if (loadError) { app.innerHTML = `<main class="loginpage"><section class="logincard"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" data-action="signout">Return to sign in</button></section></main>`; return; }
@@ -616,8 +719,8 @@ function exportIcs() { const compact = s => s.replaceAll('-', ''), events = requ
 app.addEventListener('click', async e => {
   const authTab = e.target.closest('[data-auth-mode]');
   if (authTab) {
-    authMode = authTab.dataset.authMode;
-    // Leaving a broken recovery link for Forgot / Sign in / Create password.
+    authMode = authTab.dataset.authMode === 'signup' ? 'signin' : authTab.dataset.authMode;
+    // Leaving a broken recovery link for Forgot / Sign in.
     if (passwordRecovery || hasRecoveryIntent()) {
       passwordRecovery = false;
       recoveryError = '';
@@ -660,7 +763,23 @@ app.addEventListener('click', async e => {
   const resend = e.target.closest('[data-resendinvite]');
   if (resend && isAdmin()) {
     const p = person(resend.dataset.resendinvite);
-    if (p?.email) openModal({kind:'invite', email:p.email});
+    if (!p?.email) return;
+    try {
+      const tempPassword = generateTempPassword();
+      await supabase.rpc('set_must_change_password', { p_id: p.id, p_value: true }).catch(() => {});
+      const provisioned = await provisionAuthUser(p.email, p.name, tempPassword);
+      openModal({
+        kind: 'invite',
+        email: p.email,
+        password: provisioned.password,
+        method: provisioned.method,
+        needsConfirm: !!provisioned.needsConfirm
+      });
+      await loadAuthStatus();
+      toast('Temporary password ready — email it now.');
+    } catch (err) {
+      toast(err.message || 'Could not regenerate access.');
+    }
     return;
   }
   const userFilterBtn = e.target.closest('[data-userfilter]');
@@ -690,6 +809,7 @@ app.addEventListener('click', async e => {
   if (button.dataset.action === 'close') { if (e.target === button || button.tagName === 'BUTTON') closeModal(); return; }
   if (button.dataset.action === 'enterworkspace') {
     passwordSavedOk = false;
+    if (mustChangePassword) { render(); return; }
     if (!loadError) startLive();
     render();
     return;
@@ -699,6 +819,7 @@ app.addEventListener('click', async e => {
     passwordRecovery = false;
     recoveryError = '';
     passwordSavedOk = false;
+    mustChangePassword = false;
     clearRecoveryIntent();
     stopLive();
     await supabase.auth.signOut();
@@ -824,28 +945,41 @@ app.addEventListener('submit', async e => {
       const {data:invited, error:inviteError} = await supabase.rpc('is_invited_email', {p_email:email});
       if (inviteError) { setError(formatRpcError(inviteError.message)); return; }
       if (!invited) {
-        setError('This email is not an active team member. Ask an admin to add (or reactivate) you. If you were just invited, use Create password — not Forgot password.');
+        setError('This email is not an active team member. Ask an admin to add (or reactivate) you.');
         return;
       }
       markRecoveryIntent();
       const {error} = await supabase.auth.resetPasswordForEmail(email, {redirectTo: appRedirectUrl()});
       if (error) { clearRecoveryIntent(); setError(error.message); return; }
-      f.innerHTML = `<div class="okbox" role="status"><b>Check your email</b><p>If this address already has a Team Leave password, a reset link is on its way (check spam). Open the link to set a new password on this site.</p><p>Never created a password? Use <button type="button" class="loginlink inline" data-auth-mode="signup">Create password</button> instead — reset only works after the first password exists.</p></div>`;
+      f.innerHTML = `<div class="okbox" role="status"><b>Check your email</b><p>If this address already has a Team Leave account, a reset link is on its way (check spam). Open the link to set a new password on this site.</p><p>New teammate without a password yet? Ask an admin to use Add user / Resend invite so you receive a temporary password.</p></div>`;
       return;
     }
     const password = f.elements.password.value;
-    if (authMode === 'signup') {
-      if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; }
-      const {data:invited, error:inviteError} = await supabase.rpc('is_invited_email', {p_email:email});
-      if (inviteError) { setError(formatRpcError(inviteError.message)); return; }
-      if (!invited) { setError('This email is not on the team yet. Ask an admin to add you first.'); return; }
-    }
-    const result = authMode === 'signup' ? await supabase.auth.signUp({email, password}) : await supabase.auth.signInWithPassword({email, password});
+    const result = await supabase.auth.signInWithPassword({email, password});
     if (result.error) { setError(result.error.message); return; }
-    if (authMode === 'signup' && !result.data.session) { f.innerHTML = '<div class="okbox">Password created. If email confirmation is enabled, check your inbox before signing in.</div>'; return; }
     session = result.data.session; loadError = ''; passwordRecovery = false; recoveryError = ''; clearRecoveryIntent();
-    if (session) { try { await loadState(); startLive(); } catch (err) { loadError = err.message; } }
+    if (session) { try { await loadState(); if (!mustChangePassword) startLive(); } catch (err) { loadError = err.message; } }
     render(); return;
+  }
+  if (e.target.id === 'forcechangepasswordform') {
+    e.preventDefault();
+    const f = e.target, password = f.elements.password.value;
+    if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; }
+    setError('');
+    const {error} = await supabase.auth.updateUser({password});
+    if (error) { setError(error.message); return; }
+    const {error: clearError} = await supabase.rpc('clear_must_change_password');
+    if (clearError) {
+      // Column/RPC may be missing until SQL hotfix — still treat local session as cleared.
+      console.warn(clearError.message);
+    }
+    mustChangePassword = false;
+    loadError = '';
+    try { await loadState(); startLive(); }
+    catch (err) { loadError = err.message; }
+    passwordSavedOk = true;
+    render();
+    return;
   }
   if (e.target.id === 'recoveryform') {
     e.preventDefault();
@@ -854,6 +988,8 @@ app.addEventListener('submit', async e => {
     setError('');
     const {error} = await supabase.auth.updateUser({password});
     if (error) { setError(error.message); return; }
+    await supabase.rpc('clear_must_change_password').catch(() => {});
+    mustChangePassword = false;
     passwordRecovery = false;
     recoveryError = '';
     clearRecoveryIntent();
@@ -865,7 +1001,18 @@ app.addEventListener('submit', async e => {
     render();
     return;
   }
-  if (e.target.id === 'passwordform') { e.preventDefault(); const f = e.target, password = f.elements.password.value; if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; } const {error} = await supabase.auth.updateUser({password}); if (error) setError(error.message); else { closeModal(); toast('Password updated.'); } return; }
+  if (e.target.id === 'passwordform') {
+    e.preventDefault();
+    const f = e.target, password = f.elements.password.value;
+    if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; }
+    const {error} = await supabase.auth.updateUser({password});
+    if (error) { setError(error.message); return; }
+    await supabase.rpc('clear_must_change_password').catch(() => {});
+    mustChangePassword = false;
+    closeModal();
+    toast('Password updated.');
+    return;
+  }
   if (e.target.id === 'edituserform') {
     e.preventDefault(); const f = e.target;
     const makingInactive = !f.elements.active.checked;
@@ -897,7 +1044,39 @@ app.addEventListener('submit', async e => {
     } catch (err) { setError(err.message); }
     return;
   }
-  if (e.target.id === 'teamform') { e.preventDefault(); const f = e.target, email = f.elements.email.value.trim().toLowerCase(); try { await save('/api/people', {name:f.elements.name.value, email, allowance:Number(f.elements.allowance.value), team:f.elements.team.value, managerEmail:f.elements.managerEmail.value.trim()}); openModal({kind:'invite', email}); } catch (err) { setError(err.message); } return; }
+  if (e.target.id === 'teamform') {
+    e.preventDefault();
+    const f = e.target;
+    const email = f.elements.email.value.trim().toLowerCase();
+    const name = f.elements.name.value.trim();
+    const submitBtn = f.querySelector('button[type="submit"]');
+    if (submitBtn) submitBtn.disabled = true;
+    setError('');
+    try {
+      const tempPassword = generateTempPassword();
+      await save('/api/people', {
+        name,
+        email,
+        allowance: Number(f.elements.allowance.value),
+        team: f.elements.team.value,
+        managerEmail: f.elements.managerEmail.value.trim()
+      });
+      const provisioned = await provisionAuthUser(email, name, tempPassword);
+      openModal({
+        kind: 'invite',
+        email,
+        password: provisioned.password,
+        method: provisioned.method,
+        needsConfirm: !!provisioned.needsConfirm
+      });
+      toast('User added — email the temporary password.');
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      if (submitBtn) submitBtn.disabled = false;
+    }
+    return;
+  }
   if (e.target.id === 'holidayform') { e.preventDefault(); const f = e.target; try { await save('/api/holidays', {date:f.elements.date.value, name:f.elements.name.value.trim()}); openModal({kind:'manageholidays'}); toast('Holiday saved.'); } catch (err) { setError(err.message); } return; }
   if (e.target.id === 'coverageform') {
     e.preventDefault();
@@ -955,6 +1134,7 @@ app.addEventListener('submit', async e => {
 document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal && !passwordRecovery) closeModal(); });
 load();
 supabase.auth.onAuthStateChange(async (event, next) => {
+  if (provisioningAuth) return;
   if (event === 'PASSWORD_RECOVERY') {
     passwordRecovery = true;
     recoveryError = '';
@@ -986,6 +1166,7 @@ supabase.auth.onAuthStateChange(async (event, next) => {
   }
   if (event === 'SIGNED_OUT') {
     session = null;
+    mustChangePassword = false;
     stopLive();
     // Keep recovery UI if the URL still says reset (user landed without tokens).
     if (!hasRecoveryIntent()) {
@@ -996,7 +1177,12 @@ supabase.auth.onAuthStateChange(async (event, next) => {
     return;
   }
   session = next; loadError = '';
-  if (session && !passwordRecovery) { try { await loadState(); startLive(); } catch (e) { loadError = e.message; } }
-  else if (!session) stopLive();
+  if (session && !passwordRecovery) {
+    try {
+      await loadState();
+      if (!mustChangePassword) startLive();
+      else stopLive();
+    } catch (e) { loadError = e.message; }
+  } else if (!session) stopLive();
   render();
 });

@@ -28,6 +28,10 @@ for (const [label, sql] of [['schema', schema], ['upgrade', upgrade]]) {
   assert(`${label}: rollover_leave_year`, /create or replace function public\.rollover_leave_year/i.test(sql));
   assert(`${label}: team_settings`, /create table if not exists public\.team_settings/i.test(sql));
   assert(`${label}: profiles.active`, /active boolean not null default true/i.test(sql) || /add column if not exists active/i.test(sql));
+  assert(`${label}: must_change_password column`, /must_change_password boolean not null default false/i.test(sql) || /add column if not exists must_change_password/i.test(sql));
+  assert(`${label}: clear_must_change_password`, /create or replace function public\.clear_must_change_password/i.test(sql));
+  assert(`${label}: set_must_change_password`, /create or replace function public\.set_must_change_password/i.test(sql));
+  assert(`${label}: upsert sets must_change on insert`, /must_change_password = true/i.test(sql));
   assert(`${label}: upsert_profile p_active`, /p_active boolean default true/i.test(sql));
   assert(`${label}: is_admin`, /create or replace function public\.is_admin/i.test(sql));
   assert(`${label}: upsert_profile admin gate`, /if not is_admin\(\) then raise exception 'Admin access required/i.test(sql));
@@ -65,6 +69,12 @@ assert('schema counts pending in coverage', /status in \('approved', 'pending'\)
 assert('upgrade counts pending in coverage', /status in \('approved', 'pending'\)/.test(upgrade));
 assert('schema small-team coverage formula', /active_headcount\(\) <= 3/.test(schema));
 assert('schema employee self-only message', /Employees can only request leave for themselves/i.test(schema));
+
+const mustChangeHotfix = readFileSync(join(dir, 'hotfix_must_change_password.sql'), 'utf8');
+assert('must_change hotfix has column', /add column if not exists must_change_password/i.test(mustChangeHotfix));
+assert('must_change hotfix has clear RPC', /create or replace function public\.clear_must_change_password/i.test(mustChangeHotfix));
+assert('must_change hotfix has set RPC', /create or replace function public\.set_must_change_password/i.test(mustChangeHotfix));
+assert('must_change hotfix reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.test(mustChangeHotfix));
 
 const seed = readFileSync(join(dir, 'seed_ontario_holidays.sql'), 'utf8');
 assert('seed has 2027', /2027-01-01/.test(seed));
