@@ -57,7 +57,7 @@ Default Supabase mail still works with these bodies; Custom SMTP only improves d
 | `magic-link.html` / `.txt` | Magic Link |
 | `invite-user.html` / `.txt` | Invite user |
 | `change-email.html` / `.txt` | Change Email Address |
-| `welcome-temp-password.html` / `.txt` | Manual / Custom SMTP only — placeholders `{{TEMP_PASSWORD}}`, `{{EMAIL}}`, `{{APP_URL}}` |
+| `welcome-temp-password.html` / `.txt` | **Wired in the app** — Add user / Resend invite → Copy email / Open email (`src/invite-email.mjs`). Also a Custom SMTP paste aid. Placeholders in the static files: `{{TEMP_PASSWORD}}`, `{{EMAIL}}`, `{{APP_URL}}` |
 
 Plain-text (`.txt`) files are for Custom SMTP multipart or ready-to-read review. The Dashboard Body field expects the HTML version.
 
@@ -73,7 +73,7 @@ Plain-text (`.txt`) files are for Custom SMTP multipart or ready-to-read review.
 | Flow | Typical template |
 | --- | --- |
 | Forgot password / admin **Reset password** | **Reset password** (required) |
-| Admin Add user with Edge Function (auto-confirm) | No Auth confirmation email; admin uses **mailto** with temp password → use `welcome-temp-password.*` as a paste aid |
+| Admin Add user with Edge Function (auto-confirm) | No Auth confirmation email; admin **Copy email / Open email** uses `welcome-temp-password` subject/body from `src/invite-email.mjs` |
 | Client `signUp` fallback (Confirm email **on**) | **Confirm signup** |
 | Auth **Invite user** (Dashboard / Admin API) | **Invite user** |
 | Magic link sign-in (if enabled) | **Magic Link** |

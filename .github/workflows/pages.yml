@@ -25,6 +25,8 @@ jobs:
         run: node scripts/test-logic.mjs
       - name: Auth recovery URL helpers
         run: node scripts/test-auth-url.mjs
+      - name: Temp password mailto template
+        run: node scripts/test-invite-email.mjs
       - name: SQL source checks
         run: node scripts/test-sql.mjs
   deploy:
