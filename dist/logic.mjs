@@ -9,6 +9,18 @@ export function activePeople() {
   return people.filter(p => p.active !== false);
 }
 
+/** Auto coverage floor when team_settings.minimum_coverage is null.
+ *  Small teams (≤3): at most one person away → max(1, n − 1).
+ *  Larger teams: max(1, n − 2). */
+export function defaultCoverageMinimum(headcount) {
+  const n = Math.max(0, Number(headcount) || 0);
+  if (n <= 3) return Math.max(1, n - 1);
+  return Math.max(1, n - 2);
+}
+
+/** Normalize DB date / timestamptz strings to YYYY-MM-DD for comparisons. */
+export const dayKey = value => String(value || '').slice(0, 10);
+
 export function setTeam(list, minimum) {
   people.splice(0, people.length, ...list.map(p => ({
     ...p,
@@ -17,7 +29,7 @@ export function setTeam(list, minimum) {
     color: '#d6e3ff'
   })));
   if (minimum != null && minimum > 0) minimumCoverage = minimum;
-  else minimumCoverage = Math.max(1, activePeople().length - 2);
+  else minimumCoverage = defaultCoverageMinimum(activePeople().length);
 }
 
 export function setHolidays(list) {
@@ -85,13 +97,46 @@ export function remaining(personId, requests) {
 
 export function coverageFor(start, end, requests, candidatePerson = null, excludedId = null) {
   const headcount = activePeople().length;
-  return businessDates(start, end).map(date => {
-    const approved = new Set(requests.filter(r => r.status === 'approved' && r.type !== 'Work From Home' && r.id !== excludedId && r.start <= date && r.end >= date && activePeople().some(p => p.id === r.person)).map(r => r.person));
-    const pending = new Set(requests.filter(r => r.status === 'pending' && r.id !== excludedId && r.start <= date && r.end >= date).map(r => r.person));
-    if (candidatePerson) { approved.add(candidatePerson); pending.delete(candidatePerson); }
-    const available = headcount - approved.size;
-    return { date, approved: [...approved], pending: [...pending], available, conflict: available < minimumCoverage };
+  const activeIds = new Set(activePeople().map(p => p.id));
+  return businessDates(dayKey(start), dayKey(end)).map(date => {
+    const approved = new Set();
+    const pending = new Set();
+    for (const r of requests || []) {
+      if (!r || r.id === excludedId || r.type === 'Work From Home') continue;
+      if (!activeIds.has(r.person)) continue;
+      if (dayKey(r.start) > date || dayKey(r.end) < date) continue;
+      if (r.status === 'approved') approved.add(r.person);
+      else if (r.status === 'pending') pending.add(r.person);
+    }
+    // Pending + approved both reduce availability (WFH already skipped).
+    const away = new Set([...approved, ...pending]);
+    if (candidatePerson && activeIds.has(candidatePerson)) {
+      away.add(candidatePerson);
+      pending.delete(candidatePerson);
+    }
+    const available = headcount - away.size;
+    return {
+      date,
+      approved: [...approved],
+      pending: [...pending],
+      available,
+      conflict: available < minimumCoverage
+    };
   });
+}
+
+/** True when the person already has pending/approved leave overlapping the range. */
+export function hasOwnLeaveOverlap(personId, start, end, requests, excludeId = null) {
+  const s = dayKey(start), e = dayKey(end);
+  if (!personId || !s || !e || e < s) return false;
+  return (requests || []).some(r =>
+    r.id !== excludeId
+    && r.person === personId
+    && r.status !== 'declined'
+    && r.status !== 'cancelled'
+    && dayKey(r.start) <= e
+    && dayKey(r.end) >= s
+  );
 }
 
 /** Admin manages everyone except self. Manager: same team OR manager_email match. */
@@ -105,16 +150,17 @@ export function managesPerson(manager, employee) {
 }
 
 export function validateRequest({ start, end, person, type = 'Vacation', portion = 1, excludeId = null }, requests, today = new Date()) {
-  if (!start || !end) return 'Choose a start and end date.';
-  if (end < start) return 'The end date must be on or after the start date.';
-  if (start < iso(today)) return 'Choose a future date or today.';
-  if (start.slice(0, 4) !== end.slice(0, 4) || +start.slice(0, 4) !== today.getFullYear()) return 'Keep this request within the current leave year.';
-  const days = businessDays(start, end) * Number(portion);
+  const s = dayKey(start), e = dayKey(end);
+  if (!s || !e) return 'Choose a start and end date.';
+  if (e < s) return 'The end date must be on or after the start date.';
+  if (s < iso(today)) return 'Choose a future date or today.';
+  if (s.slice(0, 4) !== e.slice(0, 4) || +s.slice(0, 4) !== today.getFullYear()) return 'Keep this request within the current leave year.';
+  const days = businessDays(s, e) * Number(portion);
   if (!days) return 'Select at least one weekday.';
-  if (requests.some(r => r.id !== excludeId && r.person === person && r.status !== 'declined' && r.status !== 'cancelled' && r.start <= end && r.end >= start)) return 'You already have a request on these dates.';
+  if (hasOwnLeaveOverlap(person, s, e, requests, excludeId)) return 'You already have a request on these dates.';
   if (type === 'Vacation') {
     const bal = remaining(person, requests);
-    const pendingOther = requests.filter(r => r.id !== excludeId && r.person === person && r.status === 'pending' && +r.start.slice(0, 4) === today.getFullYear()).reduce((n, r) => n + balanceDuration(r), 0);
+    const pendingOther = requests.filter(r => r.id !== excludeId && r.person === person && r.status === 'pending' && +dayKey(r.start).slice(0, 4) === today.getFullYear()).reduce((n, r) => n + balanceDuration(r), 0);
     if (days > bal.available - pendingOther) return 'This request exceeds the available balance.';
   }
   return null;

@@ -53,8 +53,9 @@ Do **not** run `supabase/add_work_from_home.sql` — it is obsolete.
 
 1. Prefer `supabase/upgrade_workflow.sql` (full catch-up).
 2. Password onboarding only: `supabase/hotfix_must_change_password.sql`.
-3. Older emergency: `supabase/hotfix_live_rpcs.sql`, then still run the full upgrade soon.
-4. `supabase/hotfix_upsert_profile.sql` is Save-only and superseded by `hotfix_live_rpcs.sql`.
+3. If Review/Approve shows false “No conflict”, paste `supabase/hotfix_coverage_conflict.sql`, then still run the full upgrade soon.
+4. Older emergency: `supabase/hotfix_live_rpcs.sql`, then still run the full upgrade soon.
+5. `supabase/hotfix_upsert_profile.sql` is Save-only and superseded by `hotfix_live_rpcs.sql`.
 
 ### SQL / ops Daniela must still do on live Supabase
 
@@ -85,7 +86,7 @@ Mark in the Supabase Dashboard / browser — ops only; not automatable from this
 - **Work From Home**, **Sick**, **Personal**, and **Unpaid** do not burn vacation days.
 - `profiles.used` is **carry-in / manual adjustment only**.
 - **Carry-over default = 0** — unused vacation does not roll into the next year. At year start, managers use Reports → Reset carry-in (or `rollover_leave_year`) to set `used` to 0 for their team. Approved leave history is kept.
-- Coverage minimum defaults to `max(1, active_headcount − 2)`. Managers can set an absolute minimum in Reports. Approving below that requires the override checkbox (`p_override`).
+- Coverage minimum defaults to `max(1, n − 1)` for teams of ≤3 active people (at most one away), otherwise `max(1, n − 2)`. Managers can set an absolute minimum in Reports. Approving below that requires the override checkbox (`p_override`). Conflict checks count **approved + pending** absences (Work From Home excluded).
 
 ## Manager team scope
 

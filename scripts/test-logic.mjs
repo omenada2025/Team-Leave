@@ -1,7 +1,7 @@
 import {
   setTeam, setHolidays, remaining, balanceDuration, requestDuration, validateRequest,
   businessDays, coverageFor, minimumCoverage, holidayName, managesPerson, ontarioHolidays,
-  activePeople
+  activePeople, defaultCoverageMinimum, hasOwnLeaveOverlap, dayKey
 } from '../src/logic.mjs';
 
 let failed = 0;
@@ -40,6 +40,8 @@ const today = new Date('2026-05-01T12:00:00');
 assert('sick over balance allowed', validateRequest({ start: '2026-08-03', end: '2026-08-31', person: 'a', type: 'Sick', portion: 1 }, reqs, today) === null);
 assert('vacation over balance blocked', !!validateRequest({ start: '2026-08-03', end: '2026-08-31', person: 'a', type: 'Vacation', portion: 1 }, reqs, today));
 assert('pending reserves balance', !!validateRequest({ start: '2026-08-03', end: '2026-08-26', person: 'a', type: 'Vacation', portion: 1 }, reqs, today));
+assert('end before start rejected', validateRequest({ start: '2026-10-30', end: '2026-10-05', person: 'b', type: 'Vacation', portion: 1 }, reqs, today) === 'The end date must be on or after the start date.');
+assert('own overlap detected', hasOwnLeaveOverlap('a', '2026-06-03', '2026-06-04', reqs) === true);
 
 const conflicts = coverageFor('2026-06-01', '2026-06-05', reqs, 'b').filter(d => d.conflict);
 assert('coverage minimum formula wired', minimumCoverage === 1);
@@ -65,6 +67,43 @@ assert('ontario 2026 boxing observed', on2026.some(h => h.date === '2026-12-28')
 const on2027 = ontarioHolidays(2027);
 assert('ontario 2027 family day', on2027.some(h => h.date === '2027-02-15'));
 assert('ontario 2027 observed pair', on2027.some(h => h.date === '2027-12-27') && on2027.some(h => h.date === '2027-12-28'));
+
+assert('default min 3-person team is 2', defaultCoverageMinimum(3) === 2);
+assert('default min 4-person team is 2', defaultCoverageMinimum(4) === 2);
+assert('default min 2-person team is 1', defaultCoverageMinimum(2) === 1);
+assert('dayKey strips timestamptz', dayKey('2026-10-30T00:00:00+00') === '2026-10-30');
+
+// Daniela / dani style review: 3-person team, one approved long leave, pending same day.
+setTeam([
+  { id: 'daniela', name: 'Daniela Omena', email: 'd@x.com', allowance: 25, used: 0, role: 'admin', team: 'General', active: true },
+  { id: 'dani', name: 'dani', email: 'dani@x.com', allowance: 25, used: 0, role: 'employee', team: 'General', active: true },
+  { id: 'other', name: 'Other', email: 'o@x.com', allowance: 25, used: 0, role: 'employee', team: 'General', active: true }
+], null);
+assert('small team auto minimum is 2', minimumCoverage === 2);
+const liveReqs = [
+  { id: 'vac', person: 'daniela', start: '2026-10-30', end: '2026-11-26', portion: 1, type: 'Vacation', status: 'approved' },
+  { id: 'pers', person: 'dani', start: '2026-10-30', end: '2026-10-30', portion: 1, type: 'Personal', status: 'pending' }
+];
+const reviewRisk = coverageFor('2026-10-30', '2026-10-30', liveReqs, 'dani', 'pers').filter(d => d.conflict);
+assert('review flags conflict when second person overlaps approved leave', reviewRisk.length === 1);
+assert('review available drops to 1', reviewRisk[0].available === 1);
+
+// Pending teammate also reduces availability (same day, different people).
+setTeam([
+  { id: 'p1', name: 'P1', email: '1@x.com', allowance: 25, used: 0, role: 'employee', team: 'General', active: true },
+  { id: 'p2', name: 'P2', email: '2@x.com', allowance: 25, used: 0, role: 'employee', team: 'General', active: true },
+  { id: 'p3', name: 'P3', email: '3@x.com', allowance: 25, used: 0, role: 'employee', team: 'General', active: true },
+  { id: 'p4', name: 'P4', email: '4@x.com', allowance: 25, used: 0, role: 'employee', team: 'General', active: true }
+], 2);
+const pendingReqs = [
+  { id: 'a1', person: 'p1', start: '2026-09-01', end: '2026-09-01', portion: 1, type: 'Vacation', status: 'approved' },
+  { id: 'a2', person: 'p2', start: '2026-09-01', end: '2026-09-01', portion: 1, type: 'Sick', status: 'pending' }
+];
+const pendingRisk = coverageFor('2026-09-01', '2026-09-01', pendingReqs, 'p3', null).filter(d => d.conflict);
+assert('pending absences count toward coverage', pendingRisk.length === 1 && pendingRisk[0].available === 1);
+
+// Invalid / empty range yields no coverage days (caller must not claim "no conflict").
+assert('inverted range yields empty coverage days', coverageFor('2026-10-30', '2026-10-05', liveReqs, 'dani').length === 0);
 
 if (failed) {
   console.error(`\n${failed} assertion(s) failed`);

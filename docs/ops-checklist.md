@@ -31,10 +31,11 @@ Why `?reset=1` + implicit flow: admin-sent resets open on the employee’s devic
 
 In **SQL Editor**, run in order:
 
-1. Prefer `supabase/upgrade_workflow.sql` (idempotent; ends with `notify pgrst, 'reload schema'`). Includes `must_change_password`.
-2. Focused paste only: `supabase/hotfix_must_change_password.sql`.
-3. Emergency older catch-up: `supabase/hotfix_live_rpcs.sql`, then still run the full upgrade soon.
-4. Holiday seed if empty: `supabase/seed_ontario_holidays.sql` (or in-app **Load Ontario**).
+1. Prefer `supabase/upgrade_workflow.sql` (idempotent; ends with `notify pgrst, 'reload schema'`). Includes `must_change_password` and coverage conflict fixes.
+2. Focused paste only (password): `supabase/hotfix_must_change_password.sql`.
+3. Coverage conflict only (Review/Approve false “No conflict”): `supabase/hotfix_coverage_conflict.sql`, then still run the full upgrade soon.
+4. Emergency older catch-up: `supabase/hotfix_live_rpcs.sql`, then still run the full upgrade soon.
+5. Holiday seed if empty: `supabase/seed_ontario_holidays.sql` (or in-app **Load Ontario**).
 
 Then confirm:
 
