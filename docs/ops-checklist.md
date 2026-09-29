@@ -52,8 +52,11 @@ select email, role, active, must_change_password, used from public.profiles orde
 
 Creates / resets Auth users with a temporary password using the **service role**, then emails the branded welcome message when a mail provider secret is set.
 
-1. Install [Supabase CLI](https://supabase.com/docs/guides/cli) and log in.
-2. Dashboard → **Project Settings → API** → copy **service_role** secret.
+1. Install [Supabase CLI](https://supabase.com/docs/guides/cli) and log in (`supabase login`, or export `SUPABASE_ACCESS_TOKEN`).
+2. Dashboard → **[Project Settings → API](https://supabase.com/dashboard/project/skezxxnhsvdrwrdxabje/settings/api)** → copy the admin key for `SUPABASE_SERVICE_ROLE_KEY`:
+   - **Prefer** the classic **`service_role`** JWT (usually under **Legacy API keys**, value starts with `eyJ…`). Reveal it, copy, never commit.
+   - If the Dashboard only shows new keys (`sb_publishable_…` / `sb_secret_…`), copy the **secret** key (`sb_secret_…`) into `SUPABASE_SERVICE_ROLE_KEY`. Do **not** use the publishable/anon key.
+   - If Add user later returns “Server misconfigured” or Auth admin 401 after using only `sb_secret_…`, reveal **Legacy API keys** and set `SUPABASE_SERVICE_ROLE_KEY` to the classic `service_role` JWT instead, then redeploy.
 3. Set secrets (do not commit):
 
 ```bash
