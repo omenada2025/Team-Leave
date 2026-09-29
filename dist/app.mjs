@@ -83,14 +83,29 @@ const rpcSoft = async (fn, args) => {
 
 /**
  * Create or reset Auth user with a temp password.
- * Prefer Edge Function (service role). Fallback: signUp + restore admin session + mailto.
+ * Prefer Edge Function (service role + optional Resend/SendGrid email).
+ * Fallback: signUp + restore admin session — does NOT auto-send temp-password email.
  */
 async function provisionAuthUser(email, name, tempPassword) {
   const { data: fnData, error: fnError } = await supabase.functions.invoke('admin-create-user', {
-    body: { email, name, password: tempPassword }
+    body: {
+      email,
+      name,
+      password: tempPassword,
+      appUrl: inviteLink(),
+      sendEmail: true
+    }
   });
   if (!fnError && fnData?.ok && fnData.password) {
-    return { password: fnData.password, method: 'edge', created: !!fnData.created };
+    return {
+      password: fnData.password,
+      method: 'edge',
+      created: !!fnData.created,
+      emailSent: !!fnData.emailSent,
+      emailStatus: fnData.emailStatus || (fnData.emailSent ? 'sent' : 'not_configured'),
+      emailError: fnData.emailError || null,
+      emailProvider: fnData.emailProvider || null
+    };
   }
   const fnMsg = fnData?.error || fnError?.message || '';
   // Fallback when the Edge Function is not deployed yet.
@@ -129,7 +144,11 @@ async function provisionAuthUser(email, name, tempPassword) {
       password: tempPassword,
       method: 'signup',
       created: true,
-      needsConfirm: !!needsConfirm
+      needsConfirm: !!needsConfirm,
+      emailSent: false,
+      emailStatus: 'client_fallback',
+      emailError:
+        'Client signUp fallback cannot send the temporary password email. Deploy admin-create-user with RESEND_API_KEY (or SendGrid), or use Open email / Copy below.'
     };
   } finally {
     provisioningAuth = false;
@@ -549,7 +568,20 @@ function usersPage() {
     const awaiting = p.active !== false && (p.id in authStatusById) && !authStatusById[p.id];
     return `<div class="userrow ${p.active === false ? 'inactive' : ''}">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email || '')} · ${escapeHtml(p.team || 'General')}${p.active === false ? ' · Deactivated' : ''}</span>${authBadge(p)}</div><span class="userrole">${roleLabel(p.role)}</span><span class="userbalance"><b>${remaining(p.id, requests).available}</b> days available</span><div class="useractions">${awaiting ? `<button class="rowaction" data-resendinvite="${p.id}">Resend invite</button>` : ''}<button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button></div></div>`;
   }).join('') || '<div class="empty">No users match this filter.</div>'}</div></section>
-  <p class="userhint">Adding a user creates their team profile <b>and</b> an Auth account with a temporary password (role starts as Employee — promote later in Edit). Email them the temp password (Open email / Copy — uses the Team Leave welcome template). They must set a new password on first sign-in. Deactivating keeps leave history and blocks sign-in. Auth badges (“Never signed in” / “Has Auth”) come from <code>list_profile_auth_status</code> when you are signed in as admin.</p>`;
+  <p class="userhint">Adding a user creates their team profile <b>and</b> an Auth account with a temporary password (role starts as Employee — promote later in Edit). When mail is configured, Team Leave emails them automatically; otherwise you must use Open email / Copy. They must set a new password on first sign-in. Deactivating keeps leave history and blocks sign-in. Auth badges (“Never signed in” / “Has Auth”) come from <code>list_profile_auth_status</code> when you are signed in as admin.</p>`;
+}
+
+function inviteEmailStatusHtml(modal) {
+  if (modal.emailSent) {
+    return `<div class="okbox" role="status"><b>Email sent</b><p>Temporary password emailed to ${escapeHtml(modal.email)} (subject: ${escapeHtml(ACCESS_EMAIL_SUBJECT)}). Copy / Open email remain available as a backup.</p></div>`;
+  }
+  if (modal.emailStatus === 'failed') {
+    return `<div class="warnbox" role="alert"><b>Email was not sent</b><p>${escapeHtml(modal.emailError || 'Mail provider rejected the message.')} Use <b>Open email</b> or <b>Copy email</b> below so they still get access.</p></div>`;
+  }
+  if (modal.emailStatus === 'client_fallback') {
+    return `<div class="warnbox" role="alert"><b>Automatic email unavailable</b><p>${escapeHtml(modal.emailError || 'Client signUp fallback does not send the temporary password email.')} Use <b>Open email</b> or <b>Copy email</b> now.</p></div>`;
+  }
+  return `<div class="warnbox" role="alert"><b>Automatic email not configured</b><p>${escapeHtml(modal.emailError || 'No Resend/SendGrid secret on admin-create-user.')} Use <b>Open email</b> or <b>Copy email</b> so the teammate receives their temporary password. See ops checklist for RESEND_API_KEY.</p></div>`;
 }
 
 function renderModal() {
@@ -566,18 +598,26 @@ function renderModal() {
     const confirmNote = modal.needsConfirm
       ? '<div class="warnbox" role="status"><b>Email confirmation may be required</b><p>If they cannot sign in, turn off Confirm email in Supabase Auth, or deploy the Edge Function (auto-confirms).</p></div>'
       : '';
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ACCESS READY</div><h2>Email their temporary password</h2><p class="dialoglead">Profile and Auth account are ready. Send the temporary password now — they must change it on first sign-in.</p><div class="requestnote"><span>EMAIL</span><p>${escapeHtml(modal.email)}</p><span>TEMPORARY PASSWORD</span><p><code>${escapeHtml(password)}</code></p><span>APP LINK</span><p>${escapeHtml(appUrl)}</p><span>SUBJECT</span><p>${escapeHtml(ACCESS_EMAIL_SUBJECT)}</p></div>${confirmNote}${methodNote ? `<p class="quiet">${escapeHtml(methodNote)}</p>` : ''}<div class="dialogactions"><button class="secondary" data-copy-invite="${encodeURIComponent(copyText)}">Copy email</button><a class="primary mailbutton" href="${accessMailtoHref(modal.email, tempPw, appUrl)}">Open email</a><button class="primary" data-action="close">Done</button></div></div></div>`;
+    const emailStatus = inviteEmailStatusHtml(modal);
+    const title = modal.emailSent ? 'Access email sent' : 'Email their temporary password';
+    const lead = modal.emailSent
+      ? 'Profile and Auth account are ready. We emailed the temporary password — they must change it on first sign-in.'
+      : 'Profile and Auth account are ready. Automatic email did not go out — send the temporary password with Open email / Copy. They must change it on first sign-in.';
+    const actions = modal.emailSent
+      ? `<button class="secondary" data-copy-invite="${encodeURIComponent(copyText)}">Copy email</button><a class="secondary mailbutton" href="${accessMailtoHref(modal.email, tempPw, appUrl)}">Open email yourself</a><button class="primary" data-action="close">Done</button>`
+      : `<button class="secondary" data-copy-invite="${encodeURIComponent(copyText)}">Copy email</button><a class="primary mailbutton" href="${accessMailtoHref(modal.email, tempPw, appUrl)}">Open email</a><button class="secondary" data-action="close">Done</button>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ACCESS READY</div><h2>${title}</h2><p class="dialoglead">${lead}</p>${emailStatus}<div class="requestnote"><span>EMAIL</span><p>${escapeHtml(modal.email)}</p><span>TEMPORARY PASSWORD</span><p><code>${escapeHtml(password)}</code></p><span>APP LINK</span><p>${escapeHtml(appUrl)}</p><span>SUBJECT</span><p>${escapeHtml(ACCESS_EMAIL_SUBJECT)}</p></div>${confirmNote}${methodNote ? `<p class="quiet">${escapeHtml(methodNote)}</p>` : ''}<div class="dialogactions">${actions}</div></div></div>`;
   }
   if (modal.kind === 'help') {
     return `<div class="scrim" data-action="close"><div class="dialog dialogwide" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ONBOARDING</div><h2>How Team Leave access works</h2><p class="dialoglead">English checklist for first-time access and password resets.</p>
     <ol class="checklist">
       <li><b>Admin adds</b> the person on Users → Add user (profile + Auth user with a temporary password; starts as Employee).</li>
-      <li><b>Email the temporary password</b> (Open email / Copy). They sign in with that password.</li>
+      <li><b>They receive a temporary password email</b> when Resend/SendGrid is configured on the Edge Function; otherwise the admin uses Open email / Copy.</li>
       <li>On first sign-in they <b>must set a new password</b> before using the app.</li>
       <li><b>Forgot password</b> / admin <b>Reset password</b> send a recovery link (separate from first-login force-change).</li>
       <li>If a reset email opens Sign in with no set-password screen, Auth URL Configuration in Supabase is wrong (see README / ops checklist).</li>
       <li>Deactivated accounts: ask an <b>admin</b> to reactivate — managers cannot do this.</li>
-      <li>Managers: open <b>Requests</b> each morning. Notifications are in-app only (no email alerts).</li>
+      <li>Managers: open <b>Requests</b> each morning. Notifications are in-app only (no email alerts for leave).</li>
     </ol>
     <div class="dialogactions"><button class="primary" data-action="close">Got it</button></div></div></div>`;
   }
@@ -608,7 +648,7 @@ function renderModal() {
     const awaiting = p.active !== false && (p.id in authStatusById) && !authStatusById[p.id];
     return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">Update role, team, leave balance, or send a password reset link.${authBadge(p) ? ` ${authBadge(p)}` : ''}</p><form id="edituserform"><label>Email<input type="email" value="${escapeHtml(p.email || '')}" readonly tabindex="-1" aria-readonly="true"></label><p class="quiet">Email matches their Auth account and cannot be changed here.</p><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option><option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Admin</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${awaiting ? `<p class="quiet">No Auth account yet — use <b>Resend invite</b> on the Users list to create one and email a temporary password.</p>` : ''}${p.must_change_password ? `<p class="quiet">This user must change their temporary password on next sign-in.</p>` : ''}${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
   }
-  if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Creates their team profile and Auth account with a temporary password (starts as Employee — promote later in Edit). You will email them the temp password; they must change it on first sign-in.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
+  if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Creates their team profile and Auth account with a temporary password (starts as Employee — promote later in Edit). We try to email them automatically; if mail is not configured you will see a clear prompt to Open email / Copy. They must change the password on first sign-in.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
   if (modal.kind === 'new' || modal.kind === 'editrequest') {
     const editing = modal.kind === 'editrequest', current = editing ? requests.find(x => x.id === modal.id) : null;
     if (editing && !current) return '';
@@ -783,10 +823,15 @@ app.addEventListener('click', async e => {
         email: p.email,
         password: provisioned.password,
         method: provisioned.method,
-        needsConfirm: !!provisioned.needsConfirm
+        needsConfirm: !!provisioned.needsConfirm,
+        emailSent: !!provisioned.emailSent,
+        emailStatus: provisioned.emailStatus || 'not_configured',
+        emailError: provisioned.emailError || null
       });
       await loadAuthStatus();
-      toast('Temporary password ready — email it now.');
+      toast(provisioned.emailSent
+        ? 'Invite email sent.'
+        : 'Temporary password ready — automatic email did not send; use Open email.');
     } catch (err) {
       toast(err.message || 'Could not regenerate access.');
     }
@@ -1077,9 +1122,14 @@ app.addEventListener('submit', async e => {
         email,
         password: provisioned.password,
         method: provisioned.method,
-        needsConfirm: !!provisioned.needsConfirm
+        needsConfirm: !!provisioned.needsConfirm,
+        emailSent: !!provisioned.emailSent,
+        emailStatus: provisioned.emailStatus || 'not_configured',
+        emailError: provisioned.emailError || null
       });
-      toast('User added — email the temporary password.');
+      toast(provisioned.emailSent
+        ? 'User added — invite email sent.'
+        : 'User added — automatic email did not send; use Open email.');
     } catch (err) {
       setError(err.message);
     } finally {

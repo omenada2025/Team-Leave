@@ -48,19 +48,28 @@ select email, role, active, must_change_password, used from public.profiles orde
 -- your row should have role = 'admin'
 ```
 
-## C. Edge Function (recommended for Auth create)
+## C. Edge Function (Auth create + optional auto-email)
 
-Creates / resets Auth users with a temporary password using the **service role** (never commit that key).
+Creates / resets Auth users with a temporary password using the **service role**, then emails the branded welcome message when a mail provider secret is set.
 
 1. Install [Supabase CLI](https://supabase.com/docs/guides/cli) and log in.
 2. Dashboard → **Project Settings → API** → copy **service_role** secret.
-3. Set the function secret (do not commit):
+3. Set secrets (do not commit):
 
 ```bash
+# Required
 supabase secrets set SUPABASE_SERVICE_ROLE_KEY=YOUR_SERVICE_ROLE_KEY --project-ref skezxxnhsvdrwrdxabje
+
+# Required for automatic invite email (pick one provider)
+supabase secrets set RESEND_API_KEY=re_xxx --project-ref skezxxnhsvdrwrdxabje
+# Optional From (verify domain in Resend; default is onboarding@resend.dev for tests)
+supabase secrets set RESEND_FROM='Team Leave <onboarding@yourdomain.com>' --project-ref skezxxnhsvdrwrdxabje
+
+# OR SendGrid instead of Resend:
+# supabase secrets set SENDGRID_API_KEY=SG.xxx SENDGRID_FROM='Team Leave <noreply@yourdomain.com>' --project-ref skezxxnhsvdrwrdxabje
 ```
 
-4. Deploy:
+4. Deploy (re-deploy after any secret change so the function picks them up):
 
 ```bash
 supabase functions deploy admin-create-user --project-ref skezxxnhsvdrwrdxabje
@@ -68,7 +77,22 @@ supabase functions deploy admin-create-user --project-ref skezxxnhsvdrwrdxabje
 
 5. Source: `supabase/functions/admin-create-user/index.ts`
 
-Without the function, Add user still tries a **client signUp fallback** and shows **mailto** with the temp password. Resend / reset for an existing Auth user needs the Edge Function (or admin **Reset password** recovery email).
+### What the UI shows
+
+| Result | Modal |
+| --- | --- |
+| Mail provider sent OK | Green **Email sent** — mailto is backup only |
+| No `RESEND_API_KEY` / `SENDGRID_API_KEY` | Yellow **Automatic email not configured** + **Open email** / **Copy** |
+| Provider error | Yellow **Email was not sent** + reason + mailto still available |
+| Client `signUp` fallback (function missing) | Yellow **Automatic email unavailable** — never auto-sends temp password |
+
+Without the function, Add user still tries **client signUp** and never SMTP-sends the temp password. Resend invite for an existing Auth user needs the Edge Function (or admin **Reset password** recovery email).
+
+### Auth settings that can block sign-in (not the welcome mail)
+
+- Edge Function path auto-confirms email (`email_confirm: true`) — Confirm email can stay on.
+- Client signUp fallback: turn **Confirm email** **off**, or new users cannot sign in until they confirm.
+- Supabase Auth **Invite user** / Custom SMTP is a different flow (invite link, not our temp-password email). Prefer Resend/SendGrid on this Edge Function for the product flow Daniela expects.
 
 ## D. Audit `profiles.used` (carry-in only)
 
@@ -91,7 +115,8 @@ group by p.id order by p.email;
 - [ ] Auth URLs match section A
 - [ ] Email templates: Reset password subject starts with **Team Leave —** (see `docs/email-templates/`)
 - [ ] SQL: `must_change_password` column + RPCs applied
-- [ ] Users → Add user → **Copy email / Open email** uses subject `Team Leave — Your temporary password`
+- [ ] Users → Add user → modal shows **Email sent** (if Resend/SendGrid configured) **or** unmistakable **Automatic email not configured / was not sent** + Open email / Copy
+- [ ] Subject is `Team Leave — Your temporary password`
 - [ ] Sign in with temp password → blocked until **Choose a new password**
 - [ ] Forgot / admin Reset → **Set a new password** (recovery, separate from force-change)
 - [ ] Deactivated user cannot sign in

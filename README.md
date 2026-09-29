@@ -25,7 +25,7 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
      - `https://omenada2025.github.io/Team-Leave/?reset=1`
    - Wrong Site URL is the usual reason a reset email opens Sign in **without** tokens.
 4. **Authentication → Email Templates** — paste Team Leave subjects + HTML from [`docs/email-templates/`](docs/email-templates/README.md) (at least **Reset password**: `Team Leave — Reset your password`). Keep `{{ .ConfirmationURL }}` (do not replace with a bare Pages URL that omits the token). Optional Custom SMTP sender name: **Team Leave**.
-5. **Deploy Edge Function `admin-create-user`** (recommended) and set secret `SUPABASE_SERVICE_ROLE_KEY` — see `docs/ops-checklist.md`. Without it, Add user uses a client signUp fallback + mailto; turn **Confirm email** off if using that fallback.
+5. **Deploy Edge Function `admin-create-user`** and set `SUPABASE_SERVICE_ROLE_KEY` plus **`RESEND_API_KEY`** (or SendGrid) for automatic invite email — see `docs/ops-checklist.md`. Without mail secrets the UI shows a clear “not configured” warning and falls back to mailto. Without the function, Add user uses client signUp (no temp-password email) — turn **Confirm email** off if using that fallback.
 6. Confirm the publishable key and project URL in `src/app.mjs` (then rebuild) match this project.
 7. Push to `main`; GitHub Actions runs verify checks, then deploys `dist/` to Pages.
 
@@ -62,7 +62,7 @@ Do **not** run `supabase/add_work_from_home.sql` — it is obsolete.
 These cannot be done from the repo alone:
 
 1. **Run `upgrade_workflow.sql`** (preferred) **or** `hotfix_must_change_password.sql` so force-change + Users Save work — then holiday seed if needed.
-2. **Deploy `admin-create-user`** Edge Function with `SUPABASE_SERVICE_ROLE_KEY` secret (never commit the key).
+2. **Deploy `admin-create-user`** Edge Function with `SUPABASE_SERVICE_ROLE_KEY` and preferably `RESEND_API_KEY` / `RESEND_FROM` (never commit keys).
 3. **Audit `profiles.used`** after the balance policy: if `used` already included approved Vacation, reset carry-in so balances are not double-counted (`available = allowance − used − approved Vacation`).
 4. Optionally enable **Realtime** for `leave_requests` and `notifications` in the Supabase dashboard (the app also polls every ~45s as a fallback).
 5. **Auth URL configuration** (cannot be set from this repo): Site URL + Redirect URLs must include the Pages URL, the `/**` wildcard, and `…/?reset=1` (see Operator setup). Without this, reset emails open Sign in with no recovery tokens.
@@ -74,7 +74,7 @@ Mark in the Supabase Dashboard / browser — ops only; not automatable from this
 - [ ] **Auth → URL Configuration:** Site URL = Pages URL with trailing slash; Redirects include `/**`, bare/trailing variants, and `?reset=1`.
 - [ ] **SQL Editor:** `upgrade_workflow.sql` (or `hotfix_must_change_password.sql`) applied on project `skezxxnhsvdrwrdxabje`.
 - [ ] Confirm your profile `role = 'admin'` so Users is visible.
-- [ ] **Add user** → mailto shows temporary password → sign in → forced password change.
+- [ ] **Add user** → **Email sent** (or clear not-configured warning + mailto) → sign in → forced password change.
 - [ ] **Forgot / admin Reset** smoke → lands on **Set a new password**, not empty Sign in.
 - [ ] **Approve** a pending request (coverage override path if needed).
 - [ ] **Users → Edit → Save** works (no schema-cache 404).
@@ -99,7 +99,7 @@ Managers only **see pending/decide** requests for people on the **same `team`** 
 ## Inviting teammates
 
 1. An **admin** uses **Users → Add user** to create a **profile** and an **Auth user** with a generated **temporary password** (role starts as Employee — promote later in Edit).
-2. Admin emails the temporary password via **Open email** / **Copy** (mailto MVP; Edge Function `admin-create-user` is preferred for Auth create/reset).
+2. The Edge Function emails the temporary password when Resend/SendGrid is configured; otherwise the admin uses **Open email** / **Copy** (never a silent failure).
 3. Teammate **Signs in** → app blocks until they set a new password (`profiles.must_change_password`).
 4. There is **no** self-serve Create password tab. Keep email/password Auth enabled; Confirm email should be off if using the signUp fallback.
 5. In-app **How it works** (sidebar) and `docs/onboarding.md` have the one-page English checklist.
@@ -163,7 +163,7 @@ node scripts/test-sql.mjs
 | `supabase/upgrade_workflow.sql` | Existing-project upgrade (preferred) |
 | `supabase/hotfix_live_rpcs.sql` | Emergency paste when live is behind Pages (invite + Users RPCs) |
 | `supabase/hotfix_must_change_password.sql` | Focused paste: must_change_password + clear/set RPCs |
-| `supabase/functions/admin-create-user/` | Edge Function: create/reset Auth user with temp password |
+| `supabase/functions/admin-create-user/` | Edge Function: create/reset Auth user + optional Resend/SendGrid welcome email |
 | `supabase/hotfix_upsert_profile.sql` | Narrower Save-only paste (superseded by hotfix_live_rpcs) |
 | `supabase/seed_ontario_holidays.sql` | Holiday seed 2026–2028 |
 | `.github/workflows/ci.yml` | PR/main logic + SQL checks |
