@@ -15,9 +15,12 @@ jobs:
         run: bash scripts/build.sh
       - name: Leave balance & coverage logic
         run: node scripts/test-logic.mjs
+      - name: Auth recovery URL helpers
+        run: node scripts/test-auth-url.mjs
       - name: SQL source checks
         run: node scripts/test-sql.mjs
       - name: Dist mirrors src
         run: |
           diff -q src/logic.mjs dist/logic.mjs
           diff -q src/app.mjs dist/app.mjs
+          diff -q src/auth-url.mjs dist/auth-url.mjs
