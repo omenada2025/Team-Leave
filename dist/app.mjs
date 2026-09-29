@@ -45,6 +45,15 @@ const teamRequests = () => {
 const pendingTeamCount = () => teamRequests().filter(r => r.status === 'pending' && r.person !== me).length;
 const unreadCount = () => notifications.filter(n => !n.read).length;
 
+/** Friendlier copy when live PostgREST is missing an RPC the Pages client expects. */
+const formatRpcError = (message) => {
+  const msg = String(message || '');
+  if (/could not find the function|schema cache/i.test(msg)) {
+    return `${msg} Run supabase/hotfix_live_rpcs.sql in the Supabase SQL Editor (or the full upgrade_workflow.sql).`;
+  }
+  return msg;
+};
+
 const rpcFor = (path, data) => {
   if (path === '/api/people') return ['upsert_profile', {p_email:data.email, p_name:data.name, p_allowance:data.allowance, p_used:0, p_role:'employee', p_team:data.team || 'General', p_manager_email:data.managerEmail || null, p_active:true}];
   const personEdit = path.match(/^\/api\/people\/([^/]+)$/);
@@ -66,7 +75,7 @@ const rpcFor = (path, data) => {
 const save = async (path, data) => {
   const [fn, args] = rpcFor(path, data);
   const {error} = await supabase.rpc(fn, args);
-  if (error) throw Error(error.message);
+  if (error) throw Error(formatRpcError(error.message));
   await loadState();
 };
 
@@ -473,7 +482,7 @@ app.addEventListener('submit', async e => {
     if (authMode === 'signup') {
       if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; }
       const {data:invited, error:inviteError} = await supabase.rpc('is_invited_email', {p_email:email});
-      if (inviteError) { setError(inviteError.message); return; }
+      if (inviteError) { setError(formatRpcError(inviteError.message)); return; }
       if (!invited) { setError('This email is not on the team yet. Ask a manager to add you first.'); return; }
     }
     const result = authMode === 'signup' ? await supabase.auth.signUp({email, password}) : await supabase.auth.signInWithPassword({email, password});

@@ -24,9 +24,10 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
 
 1. In **SQL Editor**, run `supabase/upgrade_workflow.sql` (idempotent; ends with `notify pgrst, 'reload schema'`). This adds:
    - `upsert_profile(..., p_active)` matching Edit user → Save
+   - `is_invited_email` for **Create password**
    - Team-scoped `decide_leave` / RLS (`manages_person`)
    - Configurable `team_settings.minimum_coverage`
-   - Soft-deactivate (`profiles.active`)
+   - Soft-deactivate (`profiles.active` / `set_profile_active`)
    - Holiday delete + region on upsert
    - Year rollover RPC (`rollover_leave_year`, carry-over = 0)
    - Drops unused `email_events` (in-app notifications only)
@@ -36,13 +37,17 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
 
 Do **not** run `supabase/add_work_from_home.sql` — it is obsolete.
 
-**Save-only emergency:** If Edit user → Save fails with `Could not find the function public.upsert_profile(...p_active...)` and you cannot run the full upgrade yet, paste `supabase/hotfix_upsert_profile.sql` in the SQL Editor. Still run the full `upgrade_workflow.sql` soon for the rest of the RPCs.
+**When live Supabase is behind Pages** (schema-cache 404s such as `is_invited_email` or `upsert_profile(...p_active...)`):
+
+1. Prefer `supabase/upgrade_workflow.sql` (full catch-up).
+2. If you only need invite + Users unblocked quickly, paste `supabase/hotfix_live_rpcs.sql` in the SQL Editor, then still run the full upgrade soon.
+3. `supabase/hotfix_upsert_profile.sql` is Save-only and superseded by `hotfix_live_rpcs.sql`.
 
 ### SQL / ops Daniela must still do on live Supabase
 
 These cannot be done from the repo alone:
 
-1. **Run `upgrade_workflow.sql`** (preferred) **or** at minimum `hotfix_upsert_profile.sql` so Save works — then holiday seed if needed.
+1. **Run `upgrade_workflow.sql`** (preferred) **or** at minimum `hotfix_live_rpcs.sql` so Create password + Users Save work — then holiday seed if needed.
 2. **Audit `profiles.used`** after the balance policy: if `used` already included approved Vacation, reset carry-in so balances are not double-counted (`available = allowance − used − approved Vacation`).
 3. Optionally enable **Realtime** for `leave_requests` and `notifications` in the Supabase dashboard (the app also polls every ~45s as a fallback).
 
@@ -120,7 +125,8 @@ node scripts/test-sql.mjs
 | `dist/` | Built copy deployed to Pages |
 | `supabase/schema.sql` | Greenfield install |
 | `supabase/upgrade_workflow.sql` | Existing-project upgrade (preferred) |
-| `supabase/hotfix_upsert_profile.sql` | Minimal Save-error paste for live |
+| `supabase/hotfix_live_rpcs.sql` | Emergency paste when live is behind Pages (invite + Users RPCs) |
+| `supabase/hotfix_upsert_profile.sql` | Narrower Save-only paste (superseded by hotfix_live_rpcs) |
 | `supabase/seed_ontario_holidays.sql` | Holiday seed 2026–2028 |
 | `.github/workflows/ci.yml` | PR/main logic + SQL checks |
 | `.github/workflows/pages.yml` | Verify then deploy Pages |
