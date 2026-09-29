@@ -37,7 +37,8 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
    - Configurable `team_settings.minimum_coverage`
    - Soft-deactivate (`profiles.active` / `set_profile_active`)
    - Holiday delete + region on upsert
-   - Year rollover RPC (`rollover_leave_year`, carry-over = 0)
+   - Year rollover RPC (`rollover_leave_year`, carry-over = 0) + `last_rollover_at`
+   - Notification `request_id` for deep-links + admin `list_profile_auth_status`
    - Drops unused `email_events` (in-app notifications only)
    - Self-approval / coverage / Vacation balance guards (as before)
 2. If holidays are incomplete, run `supabase/seed_ontario_holidays.sql` (or Load Ontario in the app).
@@ -58,7 +59,20 @@ These cannot be done from the repo alone:
 1. **Run `upgrade_workflow.sql`** (preferred) **or** at minimum `hotfix_live_rpcs.sql` so Create password + Users Save work — then holiday seed if needed.
 2. **Audit `profiles.used`** after the balance policy: if `used` already included approved Vacation, reset carry-in so balances are not double-counted (`available = allowance − used − approved Vacation`).
 3. Optionally enable **Realtime** for `leave_requests` and `notifications` in the Supabase dashboard (the app also polls every ~45s as a fallback).
-4. **Auth URL configuration** (cannot be set from this repo): Site URL + Redirect URLs must include `https://omenada2025.github.io/Team-Leave/` (see Operator setup). Without this, reset emails open Supabase’s default site or fail redirect, and the Set new password screen never appears.
+4. **Auth URL configuration** (cannot be set from this repo): Site URL + Redirect URLs must include the Pages URL, the `/**` wildcard, and `…/?reset=1` (see Operator setup). Without this, reset emails open Sign in with no recovery tokens.
+
+### 10-minute live smoke checklist (after each merge to `main`)
+
+Mark in the Supabase Dashboard / browser — ops only; not automatable from this repo:
+
+- [ ] **Auth → URL Configuration:** Site URL = Pages URL with trailing slash; Redirects include `/**`, bare/trailing variants, and `?reset=1`.
+- [ ] **SQL Editor:** `upgrade_workflow.sql` applied on project `skezxxnhsvdrwrdxabje` (or hotfix then full upgrade).
+- [ ] Confirm your profile `role = 'admin'` so Users is visible.
+- [ ] **Create password** smoke with a test invite (`?email=` prefill).
+- [ ] **Forgot / admin Reset** smoke → lands on **Set a new password**, not empty Sign in.
+- [ ] **Approve** a pending request (coverage override path if needed).
+- [ ] **Users → Edit → Save** works (no schema-cache 404).
+- [ ] Audit `profiles.used` (carry-in only) if balances look wrong.
 
 ## Leave balance rules
 
@@ -74,18 +88,19 @@ Managers only **see pending/decide** requests for people on the **same `team`** 
 
 ## Notifications
 
-**In-app only.** The dead `email_events` path was removed. Opening Notifications marks items read and refreshes the unread badge. No Resend (or other) API keys are required.
+**In-app only.** Opening Notifications marks items read and refreshes the unread badge. Tap a notification to open the related request when `request_id` is present (needs the SQL upgrade). No Resend API keys are required. Managers should open **Requests** each morning (polling ~45s; optional Realtime in the Dashboard). Aim to respond within 2 business days.
 
 ## Inviting teammates
 
-1. A manager uses **Add user** to create a **profile** (no Auth user / temp password).
-2. Share the app link → teammate uses **Create password** with that email.
+1. An **admin** uses **Users → Add user** to create a **profile** (no Auth user / temp password; role starts as Employee — promote later in Edit).
+2. Share the invite link from the modal (includes `?email=` so Create password is prefilled) → teammate uses **Create password**.
 3. Signup calls `is_invited_email` (active profiles only).
 4. Keep **Email** signup enabled in Supabase Auth, or invite from the Dashboard. Never put passwords in email bodies.
+5. In-app **How it works** (sidebar) and `docs/onboarding.md` have the one-page English checklist.
 
 ## Soft-deactivate users
 
-Admins can uncheck **Active** on Edit user. Deactivated people stay in history, drop out of coverage headcount, and cannot Create password / open the app. Prefer this over deleting profiles.
+Admins can uncheck **Active** on Edit user. Deactivated people stay in history, drop out of coverage headcount, and cannot Create password / open the app. Prefer this over deleting profiles. The UI blocks deactivating the last active admin and asks for confirmation when deactivating yourself or another admin.
 
 ## Users page (admin only)
 
@@ -104,12 +119,12 @@ Reports → **Manage holidays**: add / edit / delete, or **Load Ontario** for th
 ## Auth notes
 
 - **Sign-in:** email + password for active team profiles.
-- **Create password:** only after an admin added (and activated) the profile. Use this for first-time access — not Forgot password.
+- **Create password:** only after an admin added (and activated) the profile. Use this for first-time access — not Forgot password. Invite links include `?email=` so the field is prefilled.
 - **Forgot password?** (auth screen): checks the email is an active team member, then calls `resetPasswordForEmail`. Reset only works if that person already created a password once.
 - **Admin Reset password** (Users → Edit user): confirmation step, then email to the profile address; success / failure shown back on Edit user. Disabled while the user is deactivated.
-- **Email link → Set new password:** the client uses **implicit** Auth flow (not PKCE) so admin-sent reset emails work on the employee’s device. On load it parses `#access_token` / `type=recovery`, `?code=`, or `token_hash`, calls `setSession` / `verifyOtp`, and **always** shows the Set new password screen when `?reset=1` or recovery intent is present — never the Sign in form.
+- **Email link → Set new password:** the client uses **implicit** Auth flow (not PKCE) so admin-sent reset emails work on the employee’s device. On load it parses `#access_token` / `type=recovery`, `?code=`, or `token_hash`, calls `setSession` / `verifyOtp`, and **always** shows the Set new password screen when `?reset=1` or recovery intent is present — never the Sign in form. After save, a **Password saved — continue to workspace** screen appears.
 - **Redirect:** Forgot and admin Reset pass `redirectTo` = `https://…/Team-Leave/?reset=1`. Allow-list that URL (and the `/**` wildcard) under Authentication → URL Configuration.
-- Deactivated / not-on-team accounts get plain-language errors; recovery still allows setting a password, with a note that an admin must reactivate before sign-in works.
+- Deactivated / not-on-team accounts get plain-language errors asking an **admin** (not manager) to reactivate; recovery still allows setting a password.
 
 ## What managers enforce in SQL
 
@@ -136,6 +151,8 @@ node scripts/test-sql.mjs
 | --- | --- |
 | `src/` | Editable SPA source |
 | `dist/` | Built copy deployed to Pages |
+| `docs/onboarding.md` | English first-access checklist |
+| `docs/ops-checklist.md` | Live Auth + SQL smoke runbook |
 | `supabase/schema.sql` | Greenfield install |
 | `supabase/upgrade_workflow.sql` | Existing-project upgrade (preferred) |
 | `supabase/hotfix_live_rpcs.sql` | Emergency paste when live is behind Pages (invite + Users RPCs) |

@@ -32,6 +32,9 @@ for (const [label, sql] of [['schema', schema], ['upgrade', upgrade]]) {
   assert(`${label}: is_admin`, /create or replace function public\.is_admin/i.test(sql));
   assert(`${label}: upsert_profile admin gate`, /if not is_admin\(\) then raise exception 'Admin access required/i.test(sql));
   assert(`${label}: role allows admin`, /role in \('employee','manager','admin'\)/i.test(sql));
+  assert(`${label}: list_profile_auth_status`, /create or replace function public\.list_profile_auth_status/i.test(sql));
+  assert(`${label}: notification request_id`, /request_id/i.test(sql));
+  assert(`${label}: last_rollover_at`, /last_rollover_at/i.test(sql));
 }
 
 assert('upgrade drops email_events', /drop table if exists public\.email_events/i.test(upgrade));

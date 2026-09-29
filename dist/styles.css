@@ -19,6 +19,24 @@
 .checklist li{margin:4px 0}
 .userrow.inactive{opacity:.55}
 .primary:disabled,.primary[disabled]{opacity:.45;cursor:not-allowed}
+.mobileaccount{display:none;align-items:center;gap:6px}
+.mobileaccount .textbtn{font-size:12px;padding:6px 8px;border:1px solid #e5e6eb;background:#fff;border-radius:8px;color:#5f557d}
+.authbadge{display:inline-block;margin-top:6px;font-size:11px;font-weight:700;padding:3px 8px;border-radius:999px;letter-spacing:.02em}
+.authbadge.awaiting{background:#fff4e5;color:#9a5b12}
+.authbadge.hasauth{background:#e8f6ee;color:#1f6b43}
+.useractions{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.usersearch{display:grid;gap:6px;margin:4px 0 12px;font-size:13px;color:#656d7e;max-width:320px}
+.usersearch input{border:1px solid #e1e4ea;border-radius:10px;padding:10px 12px;background:#fff}
+.notificationlist .notification{display:grid;gap:4px;width:100%;text-align:left;border:0;background:transparent;padding:14px 4px;border-top:1px solid #eef0f3;cursor:pointer;color:inherit}
+.notificationlist .notification:hover{background:#f7f8fb}
+.rowhighlight{background:#f3efff !important;outline:2px solid #c9b8f5;outline-offset:-2px}
+.glossaryhint{margin:8px 2px 18px;font-size:14px;color:#656d7e;line-height:1.5}
+.exportnote{margin:-4px 2px 16px}
+.callegendhint{color:#8a92a1;font-size:12px;margin-left:8px}
+@media(max-width:700px){
+  .mobileaccount{display:flex}
+  .callegendhint{display:block;margin:8px 0 0;margin-left:0}
+}
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{animation-duration:.01ms!important;animation-iteration-count:1!important;transition-duration:.01ms!important;scroll-behavior:auto!important}
   #toast{transition:none}
