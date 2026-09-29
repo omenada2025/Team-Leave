@@ -56,6 +56,16 @@ assert('live hotfix has is_admin', /create or replace function public\.is_admin/
 assert('live hotfix reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.test(liveHotfix));
 assert('live hotfix promotes Daniela to admin', /role = 'admin'/.test(liveHotfix) && /rdaniglad@gmail\.com/.test(liveHotfix));
 
+const coverageHotfix = readFileSync(join(dir, 'hotfix_coverage_conflict.sql'), 'utf8');
+assert('coverage hotfix has coverage_minimum', /create or replace function public\.coverage_minimum/i.test(coverageHotfix));
+assert('coverage hotfix counts pending', /status in \('approved', 'pending'\)/.test(coverageHotfix));
+assert('coverage hotfix small-team formula', /active_headcount\(\) <= 3/.test(coverageHotfix));
+assert('coverage hotfix reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.test(coverageHotfix));
+assert('schema counts pending in coverage', /status in \('approved', 'pending'\)/.test(schema));
+assert('upgrade counts pending in coverage', /status in \('approved', 'pending'\)/.test(upgrade));
+assert('schema small-team coverage formula', /active_headcount\(\) <= 3/.test(schema));
+assert('schema employee self-only message', /Employees can only request leave for themselves/i.test(schema));
+
 const seed = readFileSync(join(dir, 'seed_ontario_holidays.sql'), 'utf8');
 assert('seed has 2027', /2027-01-01/.test(seed));
 assert('seed has 2028', /2028-01-01/.test(seed));

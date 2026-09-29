@@ -1,7 +1,8 @@
 import {
   people, minimumCoverage, holidays, holidayName, iso, parseDate, addBusinessDays, addDays,
   businessDays, requestDuration, balanceDuration, setTeam, setHolidays, remaining, coverageFor,
-  validateRequest, managesPerson, ontarioHolidays, activePeople
+  validateRequest, managesPerson, ontarioHolidays, activePeople, defaultCoverageMinimum,
+  hasOwnLeaveOverlap, dayKey
 } from './logic.mjs';
 import {
   appRedirectUrl, parseAuthUrl, scrubAuthParamsFromUrl, markRecoveryIntent,
@@ -155,7 +156,7 @@ async function loadState() {
   const configured = settingsData?.minimum_coverage ?? null;
   lastRolloverAt = settingsData?.last_rollover_at || null;
   const activeCount = profiles.filter(p => p.active !== false).length;
-  const min = configured != null ? configured : Math.max(1, activeCount - 2);
+  const min = configured != null ? configured : defaultCoverageMinimum(activeCount);
   hydrate({
     people: profiles,
     requests: (leave || []).map(r => ({...r, decisionNote: r.decision_note || ''})),
@@ -362,7 +363,7 @@ function overview() {
   <section class="stats" aria-label="At a glance"><div class="stat"><div class="stathead"><span>Available to use</span><span class="statglyph lavender">✳</span></div><strong>${balance.available}<small> days</small></strong><div class="statfoot">Your ${new Date().getFullYear()} vacation balance</div></div><div class="stat"><div class="stathead"><span>${isManagerRole() ? 'Awaiting your review' : 'Your pending requests'}</span><span class="statglyph peach">◷</span></div><strong>${isManagerRole() ? pending.length : requests.filter(r => r.status === 'pending' && r.person === me).length}<small> requests</small></strong><div class="statfoot">${isManagerRole() ? 'Aim to respond within 2 business days' : 'Waiting for manager approval'}</div></div><div class="stat"><div class="stathead"><span>Team away today</span><span class="statglyph mint">◉</span></div><strong>${awayNow}<small> people</small></strong><div class="statfoot">${head - awayNow} of ${head} available</div></div></section>
   <p class="glossaryhint"><b>Vacation</b> burns annual days. <b>Work From Home</b>, Sick, Personal, and Unpaid do not — WFH also skips coverage impact.</p>
   <div class="overviewgrid"><section class="panel"><div class="sectionhead"><div><span class="eyebrow">COMING UP</span><h3>Upcoming absences</h3></div><button class="linkbutton" data-view="calendar">View calendar <span>→</span></button></div>${soon.length ? `<div class="absence-list">${soon.map(r => `<div class="absence">${avatar(person(r.person))}<div class="absenceperson"><b>${escapeHtml(person(r.person)?.name || 'Teammate')}</b><span>${typeLabel(r)} · ${daysLabel(requestDuration(r))}</span></div><time>${range(r)}</time></div>`).join('')}</div>` : '<div class="empty">No upcoming approved time off yet.</div>'}</section>
-  <section class="panel coveragepanel"><div class="sectionhead"><div><span class="eyebrow">COVERAGE WATCH</span><h3>Needs a closer look</h3></div><span class="countpill">${risks.length} ${risks.length === 1 ? 'conflict' : 'conflicts'}</span></div>${risks.length ? risks.slice(0, 2).map(({r, days}) => `<div class="riskitem"><span class="riskicon">!</span><div><b>${escapeHtml(person(r.person)?.name || '')} · ${range(r)}</b><p>${daysLabel(days.length)} below ${minimumCoverage}-person minimum if approved. ${days[0].available} available on ${pretty(days[0].date)}.</p>${isManagerRole() ? `<button class="smalllink" data-review="${r.id}">Review request →</button>` : ''}</div></div>`).join('') : '<div class="goodstate"><span>✓</span><div><b>Coverage looks healthy</b><p>No pending requests currently fall below your team minimum.</p></div></div>'}<div class="coveragefoot">Based on approved leave · minimum ${minimumCoverage} of ${head} available</div></section></div>`;
+  <section class="panel coveragepanel"><div class="sectionhead"><div><span class="eyebrow">COVERAGE WATCH</span><h3>Needs a closer look</h3></div><span class="countpill">${risks.length} ${risks.length === 1 ? 'conflict' : 'conflicts'}</span></div>${risks.length ? risks.slice(0, 2).map(({r, days}) => `<div class="riskitem"><span class="riskicon">!</span><div><b>${escapeHtml(person(r.person)?.name || '')} · ${range(r)}</b><p>${daysLabel(days.length)} below ${minimumCoverage}-person minimum if approved. ${days[0].available} available on ${pretty(days[0].date)}.</p>${isManagerRole() ? `<button class="smalllink" data-review="${r.id}">Review request →</button>` : ''}</div></div>`).join('') : '<div class="goodstate"><span>✓</span><div><b>Coverage looks healthy</b><p>No pending requests currently fall below your team minimum.</p></div></div>'}<div class="coveragefoot">Based on approved + pending leave · minimum ${minimumCoverage} of ${head} available</div></section></div>`;
 }
 
 function requestRows(items, manager) {
@@ -388,7 +389,7 @@ function requestsPage() {
   const b = remaining(me, requests);
   return `<div class="pageheading"><div><div class="eyebrow">${isManagerRole() ? 'APPROVALS' : 'MY REQUESTS'}</div><h1>${isManagerRole() ? 'Requests & decisions' : 'Your requests'}</h1><p>${isManagerRole() ? 'You only see and decide requests for your team (same team name or people who list your email as manager). Habit: open Requests each morning — notifications are in-app only (badge refreshes about every 45s). Aim to respond within 2 business days.' : 'Submit time off and follow each request through to a decision.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
   <section class="balancebar"><div><span class="eyebrow">${new Date().getFullYear()} VACATION</span><strong>${b.available} <small>days available</small></strong></div><div class="balanceitems"><span><b>${b.allowance}</b> annual</span><span><b>${b.used}</b> carry-in</span><span><b>${b.approved}</b> approved Vacation</span><span><b>${b.pending}</b> pending Vacation</span></div></section>
-  ${isManagerRole() ? `<div class="queueintro"><span class="queueicon">◷</span><div><b>${pending} ${pending === 1 ? 'request needs' : 'requests need'} a decision</b><span>Coverage warnings use a ${minimumCoverage}-person minimum${coverageConfigured == null ? ' (auto: headcount − 2)' : ''}. Your own pending requests show Edit / Cancel below.</span></div></div>` : ''}
+  ${isManagerRole() ? `<div class="queueintro"><span class="queueicon">◷</span><div><b>${pending} ${pending === 1 ? 'request needs' : 'requests need'} a decision</b><span>Coverage warnings use a ${minimumCoverage}-person minimum${coverageConfigured == null ? ' (auto: ≤3 people → n−1, else n−2)' : ''}. Your own pending requests show Edit / Cancel below.</span></div></div>` : ''}
   <section class="panel requestspanel"><div class="sectionhead"><div><span class="eyebrow">${isManagerRole() ? 'YOUR TEAM' : 'HISTORY'}</span><h3>${isManagerRole() ? 'Team requests' : 'All your requests'}</h3></div><div class="filtertabs">${['all','pending','approved','declined','cancelled'].map(s => `<button class="${requestFilter === s ? 'active' : ''}" data-filter="${s}">${s[0].toUpperCase() + s.slice(1)}</button>`).join('')}</div></div>${requestRows(list, isManagerRole())}</section>`;
 }
 
@@ -415,7 +416,7 @@ function reportsPage() {
   const approved = requests.filter(r => r.status === 'approved');
   const used = approved.reduce((n, r) => n + balanceDuration(r), 0);
   const teams = [...new Set(people.map(p => p.team || 'General'))];
-  const formula = Math.max(1, activePeople().length - 2);
+  const formula = defaultCoverageMinimum(activePeople().length);
   const meP = mePerson();
   const utilPeople = isAdmin()
     ? people.filter(p => p.active !== false)
@@ -429,7 +430,7 @@ function reportsPage() {
   <section class="stats"><div class="stat"><div class="stathead"><span>Approved leave</span></div><strong>${used}<small> days</small></strong></div><div class="stat"><div class="stathead"><span>Pending decisions</span></div><strong>${pendingTeamCount()}<small> requests</small></strong></div><div class="stat"><div class="stathead"><span>Teams</span></div><strong>${teams.length}<small> groups</small></strong></div></section>
   <section class="panel reportpanel"><div class="sectionhead"><div><span class="eyebrow">COVERAGE</span><h3>Minimum people available</h3></div></div>
   <form id="coverageform" class="inlineform"><label>Minimum coverage <span class="optional">Leave blank for auto (${formula})</span><input name="minimum" type="number" min="1" max="${activePeople().length}" value="${coverageConfigured ?? ''}" placeholder="${formula}"></label><button class="secondary" type="submit">Save coverage</button></form>
-  <p class="quiet">Current effective minimum: <b>${minimumCoverage}</b>${coverageConfigured == null ? ' (auto: active headcount − 2)' : ' (configured)'}.</p></section>
+  <p class="quiet">Current effective minimum: <b>${minimumCoverage}</b>${coverageConfigured == null ? ' (auto: ≤3 people → n−1, else n−2)' : ' (configured)'}.</p></section>
   <section class="panel reportpanel"><div class="sectionhead"><div><span class="eyebrow">YEAR END</span><h3>Leave-year checklist</h3></div></div>
   <ol class="checklist"><li>Confirm all pending Vacation for this year is decided${pendingVacation.length ? ` — <b class="dangertext">${pendingVacation.length} still pending</b>` : ''}.</li><li>Export CSV / ICS for records if needed.</li><li>Carry-over policy defaults to <b>0</b> — unused vacation does not roll into next year.</li><li>Run rollover to reset carry-in (<code>profiles.used</code>) to 0 for your team.</li></ol>
   <p class="quiet">${rolloverNote}</p>
@@ -513,11 +514,19 @@ function renderModal() {
   if (modal.kind === 'new' || modal.kind === 'editrequest') {
     const editing = modal.kind === 'editrequest', current = editing ? requests.find(x => x.id === modal.id) : null;
     if (editing && !current) return '';
-    const start = current?.start || iso(addBusinessDays(new Date(), 7)), end = current?.end || iso(addBusinessDays(new Date(), 8)), selectedPerson = current?.person || me;
+    const start = current?.start || iso(addBusinessDays(new Date(), 7)), end = current?.end || iso(addBusinessDays(new Date(), 8));
+    // Employees (and edits) are locked to self / existing person — managers/admins may submit on behalf.
+    const lockPerson = !isManagerRole() || editing;
+    const selectedPerson = lockPerson
+      ? (editing ? current.person : me)
+      : (current?.person || me);
     const options = isManagerRole()
       ? people.filter(p => p.active !== false && (p.id === me || managesPerson(mePerson(), p)))
       : people.filter(p => p.id === me);
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">${editing ? 'EDIT' : 'NEW'} REQUEST</div><h2 id="dialog-title">${editing ? 'Update' : 'Submit'} a request</h2><p class="dialoglead">Request leave or a work-from-home day. Your manager will review the details.</p><form id="requestform"><label>Employee<select name="person" ${(role === 'employee' || editing) ? 'disabled' : ''}>${options.map(p => `<option value="${p.id}" ${p.id === selectedPerson ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}</select></label><div class="formrow"><label>Request type<select name="type">${['Vacation','Sick','Personal','Unpaid','Work From Home'].map(t => `<option ${t === (current?.type || 'Vacation') ? 'selected' : ''}>${t}</option>`).join('')}</select></label><label>Duration<select name="portion"><option value="1" ${Number(current?.portion || 1) === 1 ? 'selected' : ''}>Full day(s)</option><option value="0.5" ${Number(current?.portion) === 0.5 ? 'selected' : ''}>Half day</option></select></label></div><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage">${escapeHtml(current?.note || '')}</textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">${editing ? 'Update request' : 'Submit request →'}</button></div></form></div></div>`;
+    const personField = lockPerson
+      ? `<label>Employee<input type="hidden" name="person" value="${escapeHtml(selectedPerson || '')}"><input type="text" value="${escapeHtml(person(selectedPerson)?.name || '')}" readonly tabindex="-1" aria-readonly="true"></label>`
+      : `<label>Employee<select name="person">${options.map(p => `<option value="${p.id}" ${p.id === selectedPerson ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}</select></label>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">${editing ? 'EDIT' : 'NEW'} REQUEST</div><h2 id="dialog-title">${editing ? 'Update' : 'Submit'} a request</h2><p class="dialoglead">Request leave or a work-from-home day. Your manager will review the details.${lockPerson && !editing ? ' You can only request time off for yourself.' : ''}</p><form id="requestform">${personField}<div class="formrow"><label>Request type<select name="type">${['Vacation','Sick','Personal','Unpaid','Work From Home'].map(t => `<option ${t === (current?.type || 'Vacation') ? 'selected' : ''}>${t}</option>`).join('')}</select></label><label>Duration<select name="portion"><option value="1" ${Number(current?.portion || 1) === 1 ? 'selected' : ''}>Full day(s)</option><option value="0.5" ${Number(current?.portion) === 0.5 ? 'selected' : ''}>Half day</option></select></label></div><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage">${escapeHtml(current?.note || '')}</textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">${editing ? 'Update request' : 'Submit request →'}</button></div></form></div></div>`;
   }
   const r = requests.find(x => x.id === modal.id); if (!r) return '';
   const risk = riskFor(r), b = remaining(r.person, requests);
@@ -571,10 +580,32 @@ function render() {
 
 function updatePreview() {
   const form = document.getElementById('requestform'), box = document.getElementById('requestpreview'); if (!form || !box) return;
-  const personId = form.elements.person.value, start = form.elements.start.value, end = form.elements.end.value, portion = Number(form.elements.portion.value), type = form.elements.type.value;
-  const days = businessDays(start, end) * portion, balance = remaining(personId, requests), burnsBalance = type === 'Vacation', isRemote = type === 'Work From Home', risk = coverageFor(start, end, requests, isRemote ? null : personId, modal?.id).filter(d => d.conflict);
-  const pendingOther = requests.filter(r => r.id !== modal?.id && r.person === personId && r.status === 'pending' && +r.start.slice(0, 4) === new Date().getFullYear()).reduce((n, r) => n + balanceDuration(r), 0);
-  box.innerHTML = `<div class="previewline"><span>Weekdays requested</span><b>${daysLabel(days)}</b></div><div class="previewline"><span>Already pending</span><b>${daysLabel(pendingOther)}</b></div><div class="previewline"><span>Balance after approval</span><b>${burnsBalance ? balance.available - days : balance.available} days</b></div><div class="previewline"><span>Team coverage</span><b class="${risk.length ? 'dangertext' : ''}">${isRemote ? '✓ Working remotely' : risk.length ? `⚠ ${daysLabel(risk.length)} below minimum` : '✓ No conflict found'}</b></div>`;
+  let personId = form.elements.person.value;
+  // Employees cannot spoof another person via a crafted form field.
+  if (!isManagerRole()) personId = me;
+  const start = dayKey(form.elements.start.value), end = dayKey(form.elements.end.value);
+  const portion = Number(form.elements.portion.value), type = form.elements.type.value;
+  const dateError = !start || !end
+    ? 'Choose a start and end date.'
+    : end < start
+      ? 'The end date must be on or after the start date.'
+      : null;
+  const days = dateError ? 0 : businessDays(start, end) * portion;
+  const balance = remaining(personId, requests), burnsBalance = type === 'Vacation', isRemote = type === 'Work From Home';
+  const excludeId = modal?.kind === 'editrequest' ? modal.id : null;
+  const ownOverlap = !dateError && !isRemote && hasOwnLeaveOverlap(personId, start, end, requests, excludeId);
+  const risk = (!dateError && days && !isRemote)
+    ? coverageFor(start, end, requests, personId, excludeId).filter(d => d.conflict)
+    : [];
+  const pendingOther = requests.filter(r => r.id !== excludeId && r.person === personId && r.status === 'pending' && +dayKey(r.start).slice(0, 4) === new Date().getFullYear()).reduce((n, r) => n + balanceDuration(r), 0);
+  let coverageHtml;
+  if (dateError) coverageHtml = `<b class="dangertext">⚠ ${escapeHtml(dateError)}</b>`;
+  else if (!days) coverageHtml = `<b class="dangertext">⚠ Select at least one weekday</b>`;
+  else if (isRemote) coverageHtml = `<b>✓ Working remotely</b>`;
+  else if (ownOverlap) coverageHtml = `<b class="dangertext">⚠ Overlaps your existing leave</b>`;
+  else if (risk.length) coverageHtml = `<b class="dangertext">⚠ ${daysLabel(risk.length)} below minimum</b>`;
+  else coverageHtml = `<b>✓ No conflict found</b>`;
+  box.innerHTML = `<div class="previewline"><span>Weekdays requested</span><b>${daysLabel(days)}</b></div><div class="previewline"><span>Already pending</span><b>${daysLabel(pendingOther)}</b></div><div class="previewline"><span>Balance after approval</span><b>${burnsBalance && !dateError ? balance.available - days : balance.available} days</b></div><div class="previewline"><span>Team coverage</span>${coverageHtml}</div>`;
 }
 function toast(message) { const el = document.getElementById('toast'); if (!el) return; el.textContent = message; el.classList.add('visible'); setTimeout(() => el.classList.remove('visible'), 3500); }
 function setError(message) { const el = document.getElementById('formerror'); if (el) el.textContent = message; }
@@ -876,7 +907,21 @@ app.addEventListener('submit', async e => {
     return;
   }
   if (e.target.id === 'requestform') {
-    e.preventDefault(); const f = e.target, personId = f.elements.person.value, start = f.elements.start.value, end = f.elements.end.value, portion = Number(f.elements.portion.value), type = f.elements.type.value, editing = modal.kind === 'editrequest';
+    e.preventDefault();
+    const f = e.target, editing = modal.kind === 'editrequest';
+    let personId = f.elements.person.value;
+    // Employees may only request for themselves; edits keep the original person.
+    if (!isManagerRole()) personId = me;
+    if (editing) {
+      const current = requests.find(x => x.id === modal.id);
+      if (!current) { setError('Pending request not found.'); return; }
+      personId = current.person;
+    } else if (isManagerRole() && personId !== me && !managesPerson(mePerson(), person(personId))) {
+      setError('You can only submit requests for your team.');
+      return;
+    }
+    const start = dayKey(f.elements.start.value), end = dayKey(f.elements.end.value);
+    const portion = Number(f.elements.portion.value), type = f.elements.type.value;
     const error = portion === 0.5 && start !== end ? 'Half-day requests must start and end on the same date.' : validateRequest({person:personId, start, end, type, portion, excludeId:editing ? modal.id : null}, requests);
     if (error) { setError(error); return; }
     try {

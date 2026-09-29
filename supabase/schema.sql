@@ -54,7 +54,7 @@ create table if not exists public.notifications (
   created_at timestamptz not null default now()
 );
 
--- Singleton settings. minimum_coverage null → formula greatest(1, active_headcount - 2).
+-- Singleton settings. minimum_coverage null → small teams (≤3): n−1; else n−2.
 create table if not exists public.team_settings (
   id integer primary key default 1 check (id = 1),
   minimum_coverage integer check (minimum_coverage is null or minimum_coverage >= 1),
@@ -167,7 +167,10 @@ create or replace function public.coverage_minimum() returns integer
 language sql stable set search_path=public as $$
   select coalesce(
     (select minimum_coverage from team_settings where id = 1),
-    greatest(1, public.active_headcount() - 2)
+    case
+      when public.active_headcount() <= 3 then greatest(1, public.active_headcount() - 1)
+      else greatest(1, public.active_headcount() - 2)
+    end
   )
 $$;
 
@@ -179,6 +182,9 @@ declare
   v_day date;
   v_away integer;
 begin
+  if p_end < p_start then
+    return false;
+  end if;
   v_n := public.active_headcount();
   v_min := public.coverage_minimum();
   for v_day in
@@ -186,16 +192,17 @@ begin
     where extract(isodow from g.day) < 6
       and not exists (select 1 from holidays h where h.date = g.day::date)
   loop
+    -- Count pending + approved absences (WFH does not reduce coverage).
     select count(distinct r.person)::integer into v_away
     from leave_requests r
     join profiles p on p.id = r.person and p.active
-    where r.status = 'approved'
+    where r.status in ('approved', 'pending')
       and r.type <> 'Work From Home'
       and (p_exclude is null or r.id <> p_exclude)
       and r.start <= v_day and r."end" >= v_day;
     if not exists (
       select 1 from leave_requests r
-      where r.status = 'approved'
+      where r.status in ('approved', 'pending')
         and r.type <> 'Work From Home'
         and r.person = p_person
         and (p_exclude is null or r.id <> p_exclude)
@@ -346,7 +353,9 @@ declare
   v_person profiles%rowtype;
 begin
   if v_me is null then raise exception 'Your email is not on this team.'; end if;
-  if p_person <> v_me and not (is_manager() and manages_person(p_person)) then raise exception 'Not permitted.'; end if;
+  if p_person <> v_me and not (is_manager() and manages_person(p_person)) then
+    raise exception 'Employees can only request leave for themselves.';
+  end if;
   if p_start < current_date or p_end < p_start then raise exception 'Choose valid dates.'; end if;
   if extract(year from p_start) <> extract(year from p_end)
      or extract(year from p_start) <> extract(year from current_date) then

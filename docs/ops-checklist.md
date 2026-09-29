@@ -27,7 +27,8 @@ In **SQL Editor**, run in order:
 
 1. Prefer `supabase/upgrade_workflow.sql` (idempotent; ends with `notify pgrst, 'reload schema'`).
 2. Emergency only: `supabase/hotfix_live_rpcs.sql`, then still run the full upgrade soon.
-3. Holiday seed if empty: `supabase/seed_ontario_holidays.sql` (or in-app **Load Ontario**).
+3. Coverage conflict only (Review/Approve false “No conflict”): `supabase/hotfix_coverage_conflict.sql`, then still run the full upgrade soon.
+4. Holiday seed if empty: `supabase/seed_ontario_holidays.sql` (or in-app **Load Ontario**).
 
 Then confirm:
 
