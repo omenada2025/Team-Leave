@@ -1,17 +1,30 @@
 -- Emergency paste: fixes Edit user → Save when live PostgREST cannot find
 -- public.upsert_profile(p_active, p_allowance, p_id, p_manager_email, p_name, p_role, p_team, p_used).
 -- Prefer running the full supabase/upgrade_workflow.sql when you can.
--- Safe to re-run.
+-- Safe to re-run. User-admin RPCs require role = admin.
 
 alter table public.profiles add column if not exists team text not null default 'General';
 alter table public.profiles add column if not exists manager_email text;
 alter table public.profiles add column if not exists active boolean not null default true;
 
+do $$ begin
+  alter table public.profiles drop constraint if exists profiles_role_check;
+exception when undefined_object then null; end $$;
+alter table public.profiles add constraint profiles_role_check check (role in ('employee','manager','admin'));
+
+create or replace function public.current_profile_id() returns uuid
+language sql stable security definer set search_path=public as $$
+  select id from profiles where lower(email)=lower(coalesce(auth.jwt()->>'email','')) and active limit 1
+$$;
+
+create or replace function public.is_admin() returns boolean
+language sql stable security definer set search_path=public as $$
+  select exists(select 1 from profiles where id=current_profile_id() and role='admin' and active)
+$$;
+
 create or replace function public.is_manager() returns boolean
 language sql stable security definer set search_path=public as $$
-  select exists(select 1 from profiles where id = (
-    select id from profiles where lower(email)=lower(coalesce(auth.jwt()->>'email','')) and active limit 1
-  ) and role = 'manager' and active)
+  select exists(select 1 from profiles where id=current_profile_id() and role in ('manager','admin') and active)
 $$;
 
 drop function if exists public.upsert_profile(text,text,integer,integer,text,uuid);
@@ -31,7 +44,8 @@ create or replace function public.upsert_profile(
 ) returns uuid language plpgsql security definer set search_path=public as $$
 declare v_id uuid;
 begin
-  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if not is_admin() then raise exception 'Admin access required.'; end if;
+  if p_role is not null and p_role not in ('employee','manager','admin') then raise exception 'Invalid role.'; end if;
   if p_id is not null then
     update profiles set
       name = coalesce(p_name, name),
@@ -65,7 +79,10 @@ begin
   return v_id;
 end $$;
 
+revoke all on function public.is_admin() from public;
 revoke all on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) from public,anon;
 grant execute on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) to authenticated;
+
+update public.profiles set role = 'admin', active = true where lower(email) = 'rdaniglad@gmail.com';
 
 notify pgrst, 'reload schema';

@@ -4,7 +4,8 @@
 --
 -- Adds / restores: team-scoped managers, configurable coverage, soft-deactivate,
 -- holiday delete, year rollover (carry-over = 0), drops unused email_events,
--- upsert_profile(... p_active) matching the Pages client RPC args.
+-- upsert_profile(... p_active) matching the Pages client RPC args,
+-- admin role (Users page + user-admin RPCs; managers keep leave approval).
 --
 -- If Edit user → Save fails with "Could not find ... upsert_profile(...p_active...)",
 -- prefer this full upgrade. For a Save-only emergency paste, see hotfix_upsert_profile.sql.
@@ -12,6 +13,12 @@
 alter table public.profiles add column if not exists team text not null default 'General';
 alter table public.profiles add column if not exists manager_email text;
 alter table public.profiles add column if not exists active boolean not null default true;
+-- Allow admin role (Users page + user-admin RPCs).
+do $$ begin
+  alter table public.profiles drop constraint if exists profiles_role_check;
+exception when undefined_object then null; end $$;
+alter table public.profiles add constraint profiles_role_check check (role in ('employee','manager','admin'));
+
 alter table public.leave_requests add column if not exists portion numeric(3,1) not null default 1;
 alter table public.leave_requests add column if not exists decided_by uuid references public.profiles(id);
 
@@ -65,11 +72,18 @@ language sql stable security definer set search_path=public as $$
   select id from profiles where lower(email)=lower(coalesce(auth.jwt()->>'email','')) and active limit 1
 $$;
 
-create or replace function public.is_manager() returns boolean
+create or replace function public.is_admin() returns boolean
 language sql stable security definer set search_path=public as $$
-  select exists(select 1 from profiles where id=current_profile_id() and role='manager' and active)
+  select exists(select 1 from profiles where id=current_profile_id() and role='admin' and active)
 $$;
 
+-- Managers and admins can run leave-approval / coverage RPCs.
+create or replace function public.is_manager() returns boolean
+language sql stable security definer set search_path=public as $$
+  select exists(select 1 from profiles where id=current_profile_id() and role in ('manager','admin') and active)
+$$;
+
+-- Admins manage everyone (except self). Managers: same team OR manager_email match.
 -- Never true for self (align with decide_leave + UI managesPerson).
 create or replace function public.manages_person(p_person uuid) returns boolean
 language sql stable security definer set search_path=public as $$
@@ -79,11 +93,16 @@ language sql stable security definer set search_path=public as $$
     join profiles them on them.id = p_person
     where me.id = current_profile_id()
       and me.id <> p_person
-      and me.role = 'manager'
       and me.active
       and (
-        them.team = me.team
-        or lower(coalesce(them.manager_email, '')) = lower(me.email)
+        me.role = 'admin'
+        or (
+          me.role = 'manager'
+          and (
+            them.team = me.team
+            or lower(coalesce(them.manager_email, '')) = lower(me.email)
+          )
+        )
       )
   )
 $$;
@@ -228,7 +247,8 @@ create or replace function public.upsert_profile(
 ) returns uuid language plpgsql security definer set search_path=public as $$
 declare v_id uuid;
 begin
-  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if not is_admin() then raise exception 'Admin access required.'; end if;
+  if p_role is not null and p_role not in ('employee','manager','admin') then raise exception 'Invalid role.'; end if;
   if p_id is not null then
     update profiles set
       name = coalesce(p_name, name),
@@ -265,7 +285,7 @@ end $$;
 create or replace function public.set_profile_active(p_id uuid, p_active boolean)
 returns void language plpgsql security definer set search_path=public as $$
 begin
-  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if not is_admin() then raise exception 'Admin access required.'; end if;
   if p_id = current_profile_id() then raise exception 'You cannot deactivate your own account.'; end if;
   update profiles set active = p_active where id = p_id;
   if not found then raise exception 'User not found.'; end if;
@@ -501,6 +521,7 @@ begin
 end $$;
 
 revoke all on function public.is_invited_email(text) from public;
+revoke all on function public.is_admin() from public;
 revoke all on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) from public,anon;
 revoke all on function public.set_profile_active(uuid,boolean) from public,anon;
 revoke all on function public.set_minimum_coverage(integer) from public,anon;
@@ -531,4 +552,9 @@ grant select on public.team_settings to authenticated;
 grant select, update on public.notifications to authenticated;
 
 -- Make new/replaced RPCs visible to the API immediately (avoids stale schema-cache 404s).
+-- Ensure the primary operator can open Users (admin-only).
+update public.profiles
+set role = 'admin', active = true
+where lower(email) = 'rdaniglad@gmail.com';
+
 notify pgrst, 'reload schema';

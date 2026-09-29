@@ -54,6 +54,10 @@ assert('manager scopes by manager_email', managesPerson(
 ));
 assert('manager does not scope other team', !managesPerson(manager, { id: 'd', team: 'Ops', manager_email: 'other@x.com' }));
 assert('manager cannot manage self', !managesPerson(manager, manager));
+const admin = { id: 'admin1', name: 'Ada', email: 'ada@x.com', role: 'admin', team: 'Ops' };
+assert('admin manages other team', managesPerson(admin, { id: 'd', team: 'Ops', manager_email: 'other@x.com' }));
+assert('admin cannot manage self', !managesPerson(admin, admin));
+assert('employee cannot manage', !managesPerson({ id: 'a', role: 'employee', team: 'General' }, { id: 'b', team: 'General' }));
 
 const on2026 = ontarioHolidays(2026);
 assert('ontario 2026 includes Canada Day', on2026.some(h => h.date === '2026-07-01' && h.name === 'Canada Day'));

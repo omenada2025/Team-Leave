@@ -94,10 +94,11 @@ export function coverageFor(start, end, requests, candidatePerson = null, exclud
   });
 }
 
-/** Manager scope: same team OR employee.manager_email matches manager email. */
+/** Admin manages everyone except self. Manager: same team OR manager_email match. */
 export function managesPerson(manager, employee) {
-  if (!manager || !employee || manager.role !== 'manager') return false;
-  if (manager.id === employee.id) return false;
+  if (!manager || !employee || manager.id === employee.id) return false;
+  if (manager.role === 'admin') return true;
+  if (manager.role !== 'manager') return false;
   const sameTeam = (employee.team || 'General') === (manager.team || 'General');
   const assigned = (employee.manager_email || '').toLowerCase() === (manager.email || '').toLowerCase();
   return sameTeam || assigned;

@@ -29,6 +29,9 @@ for (const [label, sql] of [['schema', schema], ['upgrade', upgrade]]) {
   assert(`${label}: team_settings`, /create table if not exists public\.team_settings/i.test(sql));
   assert(`${label}: profiles.active`, /active boolean not null default true/i.test(sql) || /add column if not exists active/i.test(sql));
   assert(`${label}: upsert_profile p_active`, /p_active boolean default true/i.test(sql));
+  assert(`${label}: is_admin`, /create or replace function public\.is_admin/i.test(sql));
+  assert(`${label}: upsert_profile admin gate`, /if not is_admin\(\) then raise exception 'Admin access required/i.test(sql));
+  assert(`${label}: role allows admin`, /role in \('employee','manager','admin'\)/i.test(sql));
 }
 
 assert('upgrade drops email_events', /drop table if exists public\.email_events/i.test(upgrade));
@@ -38,6 +41,8 @@ assert('upgrade reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.tes
 const hotfix = readFileSync(join(dir, 'hotfix_upsert_profile.sql'), 'utf8');
 assert('hotfix has upsert_profile p_active', /p_active boolean default true/i.test(hotfix));
 assert('hotfix reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.test(hotfix));
+assert('hotfix admin gate', /if not is_admin\(\)/i.test(hotfix));
+assert('hotfix promotes Daniela to admin', /role = 'admin'/.test(hotfix) && /rdaniglad@gmail\.com/.test(hotfix));
 
 const seed = readFileSync(join(dir, 'seed_ontario_holidays.sql'), 'utf8');
 assert('seed has 2027', /2027-01-01/.test(seed));

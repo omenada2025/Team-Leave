@@ -71,7 +71,17 @@ Managers only **see pending/decide** requests for people on the **same `team`** 
 
 ## Soft-deactivate users
 
-Managers can uncheck **Active** on Edit user. Deactivated people stay in history, drop out of coverage headcount, and cannot Create password / open the app. Prefer this over deleting profiles.
+Admins can uncheck **Active** on Edit user. Deactivated people stay in history, drop out of coverage headcount, and cannot Create password / open the app. Prefer this over deleting profiles.
+
+## Users page (admin only)
+
+Only profiles with `role = 'admin'` see **Users** in the nav. Managers keep leave approval / reports; they cannot open the directory, upsert profiles, or deactivate users (RPCs raise `Admin access required`). Non-admins who somehow hit Users see a clear restricted message. Change password lives in the sidebar for everyone.
+
+The upgrade promotes `rdaniglad@gmail.com` to `admin`. To grant another admin after upgrade:
+
+```sql
+update public.profiles set role = 'admin', active = true where lower(email) = 'someone@company.com';
+```
 
 ## Holidays
 
@@ -81,8 +91,8 @@ Reports → **Manage holidays**: add / edit / delete, or **Load Ontario** for th
 
 - Sign-in: email + password for active team profiles.
 - Create password: only after a manager added (and activated) the profile.
-- Forgot password / **Edit user → Reset password**: Supabase `resetPasswordForEmail` (no temporary passwords). Redirect must be allow-listed to the Pages URL.
-- Manager Reset password sends the link to that user’s profile email; success/error feedback stays in the Edit user modal.
+- Forgot password / **Edit user → Reset password** (admin only): Supabase `resetPasswordForEmail` (no temporary passwords). Redirect must be allow-listed to the Pages URL.
+- Admin Reset password sends the link to that user’s profile email; success/error feedback stays in the Edit user modal.
 
 ## What managers enforce in SQL
 

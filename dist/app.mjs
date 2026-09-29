@@ -25,6 +25,9 @@ let selectedDay = iso(new Date());
 let lastFocusEl = null;
 let realtimeChannel = null;
 let pollTimer = null;
+const isAdmin = () => role === 'admin';
+const isManagerRole = () => role === 'manager' || role === 'admin';
+const roleLabel = r => r === 'admin' ? 'Admin' : r === 'manager' ? 'Manager' : 'Employee';
 const app = document.getElementById('app');
 const person = id => people.find(p => p.id === id);
 const escapeHtml = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
@@ -36,7 +39,7 @@ const typeLabel = r => `${r.type}${Number(r.portion) === 0.5 ? ' · Half day' : 
 const mePerson = () => people.find(p => p.id === me);
 const teamRequests = () => {
   const manager = mePerson();
-  if (role !== 'manager' || !manager) return requests.filter(r => r.person === me);
+  if (!isManagerRole() || !manager) return requests.filter(r => r.person === me);
   return requests.filter(r => r.person === me || managesPerson(manager, person(r.person)));
 };
 const pendingTeamCount = () => teamRequests().filter(r => r.status === 'pending' && r.person !== me).length;
@@ -115,6 +118,7 @@ async function loadState() {
     minimumCoverage: min,
     coverageConfigured: configured
   });
+  if (view === 'users' && !isAdmin()) view = 'overview';
 }
 
 function stopLive() {
@@ -214,24 +218,24 @@ function shell(content) {
   return `<div class="shell">
     <aside class="sidebar"><div class="brand"><span class="brandmark"><b></b><b></b><b></b><b></b></span><span>team<span class="brandlight">leave</span></span></div>
       <div class="navlabel">WORKSPACE</div><nav aria-label="Main navigation">
-      ${['overview','requests','calendar',...(role === 'manager' ? ['reports'] : []),'users'].map(v => `<button class="navitem ${view === v ? 'active' : ''}" data-view="${v}" ${view === v ? 'aria-current="page"' : ''}><span class="navicon">${icon(v)}</span>${v === 'calendar' ? 'Team calendar' : v[0].toUpperCase() + v.slice(1)}${v === 'requests' && role === 'manager' && pending ? `<span class="navcount">${pending}</span>` : ''}</button>`).join('')}
-      </nav><div class="sidebottom"><button class="textbtn" data-action="signout">Sign out</button></div>
+      ${['overview','requests','calendar',...(isManagerRole() ? ['reports'] : []),...(isAdmin() ? ['users'] : [])].map(v => `<button class="navitem ${view === v ? 'active' : ''}" data-view="${v}" ${view === v ? 'aria-current="page"' : ''}><span class="navicon">${icon(v)}</span>${v === 'calendar' ? 'Team calendar' : v[0].toUpperCase() + v.slice(1)}${v === 'requests' && isManagerRole() && pending ? `<span class="navcount">${pending}</span>` : ''}</button>`).join('')}
+      </nav><div class="sidebottom"><button class="textbtn" data-action="password">Change password</button><button class="textbtn" data-action="signout">Sign out</button></div>
     </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view === 'calendar' ? 'Team calendar' : view[0].toUpperCase() + view.slice(1)}</div><div class="toptools"><button class="noticebutton" data-action="notifications" aria-label="${notices ? `Notifications, ${notices} unread` : 'Notifications'}">◔${notices ? `<b>${notices}</b>` : ''}</button><span class="private"><span class="lock">●</span> Private team</span><span class="private">${escapeHtml(mine()?.name || 'Team member')} · ${role}</span>${mine() ? avatar(mine(), true) : ''}</div></header>
     <main class="main">${content}</main></div></div>${modal ? renderModal() : ''}<div id="toast" role="status" aria-live="polite"></div>`;
 }
 
 function overview() {
   const balance = remaining(me, requests);
-  const pending = teamRequests().filter(r => r.status === 'pending' && (role !== 'manager' || r.person !== me));
+  const pending = teamRequests().filter(r => r.status === 'pending' && (!isManagerRole() || r.person !== me));
   const soon = requests.filter(r => r.status === 'approved' && r.end >= iso(new Date())).sort((a, b) => a.start.localeCompare(b.start)).slice(0, 4);
   const risks = pending.map(r => ({r, days: riskFor(r)})).filter(x => x.days.length);
   const awayNow = new Set(requests.filter(r => r.status === 'approved' && r.start <= iso(new Date()) && r.end >= iso(new Date())).map(r => r.person)).size;
   const head = activePeople().length;
-  return `<div class="pageheading"><div><div class="eyebrow">${role === 'manager' ? 'TEAM OVERVIEW' : 'YOUR TIME OFF'}</div><h1>${role === 'manager' ? 'A clearer view of time away.' : 'Make room for time away.'}</h1><p>${role === 'manager' ? 'Review requests, protect coverage, and keep everyone in the loop.' : 'Your leave balance, requests, and team plans in one place.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
-  <section class="hero"><div class="herotext"><span class="heroeyebrow">${role === 'manager' ? 'TEAM LEAVE / ' + new Date().getFullYear() : 'YOUR LEAVE / ' + new Date().getFullYear()}</span><h2>${role === 'manager' ? 'Plan together.<br>Stay covered.' : 'Time off looks<br>good on you.'}</h2><p>${role === 'manager' ? 'The team’s next decisions and availability, at a glance.' : 'You have ' + balance.available + ' days available to plan this year.'}</p><button class="whitebutton" data-action="${role === 'manager' ? 'queue' : 'new'}">${role === 'manager' ? 'Review requests' : 'Plan time off'} <span>↗</span></button></div><div class="heroart"><div class="artcircle one"></div><div class="artcircle two"></div><div class="artcard"><div class="artrow"><span class="artsun">✳</span><span>TIME TO RESET</span></div><div class="artdays">${role === 'manager' ? pending.length : balance.available}<span>${role === 'manager' ? 'to review' : 'days left'}</span></div><div class="artline"><span></span><span></span><span></span></div></div></div></section>
-  <section class="stats" aria-label="At a glance"><div class="stat"><div class="stathead"><span>Available to use</span><span class="statglyph lavender">✳</span></div><strong>${balance.available}<small> days</small></strong><div class="statfoot">Your ${new Date().getFullYear()} vacation balance</div></div><div class="stat"><div class="stathead"><span>${role === 'manager' ? 'Awaiting your review' : 'Your pending requests'}</span><span class="statglyph peach">◷</span></div><strong>${role === 'manager' ? pending.length : requests.filter(r => r.status === 'pending' && r.person === me).length}<small> requests</small></strong><div class="statfoot">${role === 'manager' ? 'Decision needed' : 'Waiting for manager approval'}</div></div><div class="stat"><div class="stathead"><span>Team away today</span><span class="statglyph mint">◉</span></div><strong>${awayNow}<small> people</small></strong><div class="statfoot">${head - awayNow} of ${head} available</div></div></section>
+  return `<div class="pageheading"><div><div class="eyebrow">${isManagerRole() ? 'TEAM OVERVIEW' : 'YOUR TIME OFF'}</div><h1>${isManagerRole() ? 'A clearer view of time away.' : 'Make room for time away.'}</h1><p>${isManagerRole() ? 'Review requests, protect coverage, and keep everyone in the loop.' : 'Your leave balance, requests, and team plans in one place.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
+  <section class="hero"><div class="herotext"><span class="heroeyebrow">${isManagerRole() ? 'TEAM LEAVE / ' + new Date().getFullYear() : 'YOUR LEAVE / ' + new Date().getFullYear()}</span><h2>${isManagerRole() ? 'Plan together.<br>Stay covered.' : 'Time off looks<br>good on you.'}</h2><p>${isManagerRole() ? 'The team’s next decisions and availability, at a glance.' : 'You have ' + balance.available + ' days available to plan this year.'}</p><button class="whitebutton" data-action="${isManagerRole() ? 'queue' : 'new'}">${isManagerRole() ? 'Review requests' : 'Plan time off'} <span>↗</span></button></div><div class="heroart"><div class="artcircle one"></div><div class="artcircle two"></div><div class="artcard"><div class="artrow"><span class="artsun">✳</span><span>TIME TO RESET</span></div><div class="artdays">${isManagerRole() ? pending.length : balance.available}<span>${isManagerRole() ? 'to review' : 'days left'}</span></div><div class="artline"><span></span><span></span><span></span></div></div></div></section>
+  <section class="stats" aria-label="At a glance"><div class="stat"><div class="stathead"><span>Available to use</span><span class="statglyph lavender">✳</span></div><strong>${balance.available}<small> days</small></strong><div class="statfoot">Your ${new Date().getFullYear()} vacation balance</div></div><div class="stat"><div class="stathead"><span>${isManagerRole() ? 'Awaiting your review' : 'Your pending requests'}</span><span class="statglyph peach">◷</span></div><strong>${isManagerRole() ? pending.length : requests.filter(r => r.status === 'pending' && r.person === me).length}<small> requests</small></strong><div class="statfoot">${isManagerRole() ? 'Decision needed' : 'Waiting for manager approval'}</div></div><div class="stat"><div class="stathead"><span>Team away today</span><span class="statglyph mint">◉</span></div><strong>${awayNow}<small> people</small></strong><div class="statfoot">${head - awayNow} of ${head} available</div></div></section>
   <div class="overviewgrid"><section class="panel"><div class="sectionhead"><div><span class="eyebrow">COMING UP</span><h3>Upcoming absences</h3></div><button class="linkbutton" data-view="calendar">View calendar <span>→</span></button></div>${soon.length ? `<div class="absence-list">${soon.map(r => `<div class="absence">${avatar(person(r.person))}<div class="absenceperson"><b>${escapeHtml(person(r.person)?.name || 'Teammate')}</b><span>${typeLabel(r)} · ${daysLabel(requestDuration(r))}</span></div><time>${range(r)}</time></div>`).join('')}</div>` : '<div class="empty">No upcoming approved time off yet.</div>'}</section>
-  <section class="panel coveragepanel"><div class="sectionhead"><div><span class="eyebrow">COVERAGE WATCH</span><h3>Needs a closer look</h3></div><span class="countpill">${risks.length} ${risks.length === 1 ? 'conflict' : 'conflicts'}</span></div>${risks.length ? risks.slice(0, 2).map(({r, days}) => `<div class="riskitem"><span class="riskicon">!</span><div><b>${escapeHtml(person(r.person)?.name || '')} · ${range(r)}</b><p>${daysLabel(days.length)} below ${minimumCoverage}-person minimum if approved. ${days[0].available} available on ${pretty(days[0].date)}.</p>${role === 'manager' ? `<button class="smalllink" data-review="${r.id}">Review request →</button>` : ''}</div></div>`).join('') : '<div class="goodstate"><span>✓</span><div><b>Coverage looks healthy</b><p>No pending requests currently fall below your team minimum.</p></div></div>'}<div class="coveragefoot">Based on approved leave · minimum ${minimumCoverage} of ${head} available</div></section></div>`;
+  <section class="panel coveragepanel"><div class="sectionhead"><div><span class="eyebrow">COVERAGE WATCH</span><h3>Needs a closer look</h3></div><span class="countpill">${risks.length} ${risks.length === 1 ? 'conflict' : 'conflicts'}</span></div>${risks.length ? risks.slice(0, 2).map(({r, days}) => `<div class="riskitem"><span class="riskicon">!</span><div><b>${escapeHtml(person(r.person)?.name || '')} · ${range(r)}</b><p>${daysLabel(days.length)} below ${minimumCoverage}-person minimum if approved. ${days[0].available} available on ${pretty(days[0].date)}.</p>${isManagerRole() ? `<button class="smalllink" data-review="${r.id}">Review request →</button>` : ''}</div></div>`).join('') : '<div class="goodstate"><span>✓</span><div><b>Coverage looks healthy</b><p>No pending requests currently fall below your team minimum.</p></div></div>'}<div class="coveragefoot">Based on approved leave · minimum ${minimumCoverage} of ${head} available</div></section></div>`;
 }
 
 function requestRows(items, manager) {
@@ -246,11 +250,11 @@ function requestRows(items, manager) {
 function requestsPage() {
   const source = teamRequests();
   const list = source.filter(r => requestFilter === 'all' || r.status === requestFilter).sort(requestOrder);
-  const pending = list.filter(r => r.status === 'pending' && (role !== 'manager' || r.person !== me)).length;
+  const pending = list.filter(r => r.status === 'pending' && (!isManagerRole() || r.person !== me)).length;
   const b = remaining(me, requests);
-  return `<div class="pageheading"><div><div class="eyebrow">${role === 'manager' ? 'APPROVALS' : 'MY REQUESTS'}</div><h1>${role === 'manager' ? 'Requests & decisions' : 'Your requests'}</h1><p>${role === 'manager' ? 'You only see and decide requests for your team (same team name or people who list your email as manager).' : 'Submit time off and follow each request through to a decision.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
+  return `<div class="pageheading"><div><div class="eyebrow">${isManagerRole() ? 'APPROVALS' : 'MY REQUESTS'}</div><h1>${isManagerRole() ? 'Requests & decisions' : 'Your requests'}</h1><p>${isManagerRole() ? 'You only see and decide requests for your team (same team name or people who list your email as manager).' : 'Submit time off and follow each request through to a decision.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
   ${role === 'employee' ? `<section class="balancebar"><div><span class="eyebrow">${new Date().getFullYear()} VACATION</span><strong>${b.available} <small>days available</small></strong></div><div class="balanceitems"><span><b>${b.allowance}</b> annual</span><span><b>${b.used}</b> carry-in</span><span><b>${b.approved}</b> approved Vacation</span><span><b>${b.pending}</b> pending Vacation</span></div></section>` : `<div class="queueintro"><span class="queueicon">◷</span><div><b>${pending} ${pending === 1 ? 'request needs' : 'requests need'} a decision</b><span>Coverage warnings use a ${minimumCoverage}-person minimum${coverageConfigured == null ? ' (auto: headcount − 2)' : ''}.</span></div></div>`}
-  <section class="panel requestspanel"><div class="sectionhead"><div><span class="eyebrow">${role === 'manager' ? 'YOUR TEAM' : 'HISTORY'}</span><h3>${role === 'manager' ? 'Team requests' : 'All your requests'}</h3></div><div class="filtertabs">${['all','pending','approved','declined','cancelled'].map(s => `<button class="${requestFilter === s ? 'active' : ''}" data-filter="${s}">${s[0].toUpperCase() + s.slice(1)}</button>`).join('')}</div></div>${requestRows(list, role === 'manager')}</section>`;
+  <section class="panel requestspanel"><div class="sectionhead"><div><span class="eyebrow">${isManagerRole() ? 'YOUR TEAM' : 'HISTORY'}</span><h3>${isManagerRole() ? 'Team requests' : 'All your requests'}</h3></div><div class="filtertabs">${['all','pending','approved','declined','cancelled'].map(s => `<button class="${requestFilter === s ? 'active' : ''}" data-filter="${s}">${s[0].toUpperCase() + s.slice(1)}</button>`).join('')}</div></div>${requestRows(list, isManagerRole())}</section>`;
 }
 
 function calendarPage() {
@@ -290,12 +294,14 @@ function reportsPage() {
 }
 
 function usersPage() {
-  const minePerson = mine();
-  const list = role === 'manager' ? people : [minePerson];
-  return `<div class="pageheading"><div><div class="eyebrow">ACCOUNT & ACCESS</div><h1>${role === 'manager' ? 'Team users' : 'Your account'}</h1><p>${role === 'manager' ? 'Manage team roles, leave balances, and deactivate people without deleting history.' : 'Your profile and leave balance.'}</p></div><div class="reportactions"><button class="secondary" data-action="password">Change password</button>${role === 'manager' ? '<button class="primary topaction" data-action="adduser">+ Add user</button>' : ''}</div></div>
-  <section class="panel userspanel"><div class="sectionhead"><div><span class="eyebrow">${role === 'manager' ? 'TEAM DIRECTORY' : 'PROFILE'}</span><h3>${role === 'manager' ? `${people.length} users` : 'Your details'}</h3></div></div>
-  <div class="userlist">${list.map(p => `<div class="userrow ${p.active === false ? 'inactive' : ''}">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email || '')} · ${escapeHtml(p.team || 'General')}${p.active === false ? ' · Deactivated' : ''}</span></div><span class="userrole">${p.role === 'manager' ? 'Manager' : 'Employee'}</span><span class="userbalance"><b>${remaining(p.id, requests).available}</b> days available</span>${role === 'manager' ? `<button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button>` : ''}</div>`).join('')}</div></section>
-  ${role === 'manager' ? '<p class="userhint">Adding a user creates their team profile only. Ask them to open Team Leave and use Create password with that work email — never share a temporary password. Deactivating keeps leave history and blocks Create password / sign-in for that profile.</p>' : '<p class="userhint">Your manager can update your allowance or role. Use Sign out when you finish.</p>'}`;
+  if (!isAdmin()) {
+    return `<div class="pageheading"><div><div class="eyebrow">RESTRICTED</div><h1>Admin access required</h1><p>Only administrators can open Team users. Ask an admin if you need a profile change, allowance update, or password reset link.</p></div></div>
+    <section class="panel"><div class="okbox">You can still change your own password from the sidebar.</div></section>`;
+  }
+  return `<div class="pageheading"><div><div class="eyebrow">ACCOUNT & ACCESS</div><h1>Team users</h1><p>Admin-only: manage roles, leave balances, deactivate people, and send password reset links.</p></div><div class="reportactions"><button class="primary topaction" data-action="adduser">+ Add user</button></div></div>
+  <section class="panel userspanel"><div class="sectionhead"><div><span class="eyebrow">TEAM DIRECTORY</span><h3>${people.length} users</h3></div></div>
+  <div class="userlist">${people.map(p => `<div class="userrow ${p.active === false ? 'inactive' : ''}">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email || '')} · ${escapeHtml(p.team || 'General')}${p.active === false ? ' · Deactivated' : ''}</span></div><span class="userrole">${roleLabel(p.role)}</span><span class="userbalance"><b>${remaining(p.id, requests).available}</b> days available</span><button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button></div>`).join('')}</div></section>
+  <p class="userhint">Adding a user creates their team profile only. Ask them to open Team Leave and use Create password with that work email — never share a temporary password. Deactivating keeps leave history and blocks Create password / sign-in for that profile.</p>`;
 }
 
 function renderModal() {
@@ -322,14 +328,14 @@ function renderModal() {
     const resetOk = modal.resetSent
       ? `<div class="okbox" id="resetfeedback" role="status">Password reset link sent to ${escapeHtml(p.email)}. They can set a new password from the email link (no temporary password).</div>`
       : `<div id="resetfeedback"></div>`;
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">${escapeHtml(p.email)}</p><form id="edituserform"><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">${escapeHtml(p.email)}</p><form id="edituserform"><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option><option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Admin</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
   }
   if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create their team profile. They will create their own password from the sign-in page.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
   if (modal.kind === 'new' || modal.kind === 'editrequest') {
     const editing = modal.kind === 'editrequest', current = editing ? requests.find(x => x.id === modal.id) : null;
     if (editing && !current) return '';
     const start = current?.start || iso(addBusinessDays(new Date(), 7)), end = current?.end || iso(addBusinessDays(new Date(), 8)), selectedPerson = current?.person || me;
-    const options = role === 'manager'
+    const options = isManagerRole()
       ? people.filter(p => p.active !== false && (p.id === me || managesPerson(mePerson(), p)))
       : people.filter(p => p.id === me);
     return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">${editing ? 'EDIT' : 'NEW'} REQUEST</div><h2 id="dialog-title">${editing ? 'Update' : 'Submit'} a request</h2><p class="dialoglead">Request leave or a work-from-home day. Your manager will review the details.</p><form id="requestform"><label>Employee<select name="person" ${(role === 'employee' || editing) ? 'disabled' : ''}>${options.map(p => `<option value="${p.id}" ${p.id === selectedPerson ? 'selected' : ''}>${escapeHtml(p.name)}</option>`).join('')}</select></label><div class="formrow"><label>Request type<select name="type">${['Vacation','Sick','Personal','Unpaid','Work From Home'].map(t => `<option ${t === (current?.type || 'Vacation') ? 'selected' : ''}>${t}</option>`).join('')}</select></label><label>Duration<select name="portion"><option value="1" ${Number(current?.portion || 1) === 1 ? 'selected' : ''}>Full day(s)</option><option value="0.5" ${Number(current?.portion) === 0.5 ? 'selected' : ''}>Half day</option></select></label></div><div class="formrow"><label>Start date<input name="start" type="date" min="${iso(new Date())}" value="${start}" required></label><label>End date<input name="end" type="date" min="${iso(new Date())}" value="${end}" required></label></div><label>Note for manager <span class="optional">Optional</span><textarea name="note" maxlength="500" placeholder="Anything helpful for planning coverage">${escapeHtml(current?.note || '')}</textarea></label><div id="requestpreview" class="requestpreview"></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" class="primary">${editing ? 'Update request' : 'Submit request →'}</button></div></form></div></div>`;
@@ -349,7 +355,8 @@ function render() {
     return;
   }
   if (loadError) { app.innerHTML = `<main class="loginpage"><section class="logincard"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" data-action="signout">Return to sign in</button></section></main>`; return; }
-  app.innerHTML = shell(view === 'overview' ? overview() : view === 'requests' ? requestsPage() : view === 'users' ? usersPage() : view === 'reports' ? reportsPage() : calendarPage());
+  const page = view === 'users' && !isAdmin() ? usersPage() : view === 'overview' ? overview() : view === 'requests' ? requestsPage() : view === 'users' ? usersPage() : view === 'reports' ? reportsPage() : calendarPage();
+  app.innerHTML = shell(page);
   if (modal?.kind === 'new' || modal?.kind === 'editrequest') updatePreview();
   if (modal) afterModalMount();
 }
@@ -369,12 +376,12 @@ function exportIcs() { const compact = s => s.replaceAll('-', ''), events = requ
 app.addEventListener('click', async e => {
   const authTab = e.target.closest('[data-auth-mode]'); if (authTab) { authMode = authTab.dataset.authMode; render(); return; }
   const copy = e.target.closest('[data-copy-invite]'); if (copy) { await navigator.clipboard.writeText(decodeURIComponent(copy.dataset.copyInvite)); toast('Access details copied.'); return; }
-  const nav = e.target.closest('[data-view]'); if (nav) { view = nav.dataset.view; modal = null; render(); return; }
+  const nav = e.target.closest('[data-view]'); if (nav) { if (nav.dataset.view === 'users' && !isAdmin()) { toast('Only admins can manage users.'); return; } view = nav.dataset.view; modal = null; render(); return; }
   const filter = e.target.closest('[data-filter]'); if (filter) { requestFilter = filter.dataset.filter; render(); return; }
 
-  const edit = e.target.closest('[data-edituser]'); if (edit && role === 'manager') { openModal({kind:'edituser', id:edit.dataset.edituser}); return; }
+  const edit = e.target.closest('[data-edituser]'); if (edit && isAdmin()) { openModal({kind:'edituser', id:edit.dataset.edituser}); return; }
   const editRequest = e.target.closest('[data-editrequest]'); if (editRequest) { const r = requests.find(x => x.id === editRequest.dataset.editrequest); if (r?.person === me && r.status === 'pending') openModal({kind:'editrequest', id:r.id}); return; }
-  const review = e.target.closest('[data-review]'); if (review) { if (role !== 'manager') return; const r = requests.find(x => x.id === review.dataset.review); if (!r || !managesPerson(mePerson(), person(r.person))) { toast('You can only decide requests for your team.'); return; } openModal({kind:'review', id:review.dataset.review}); return; }
+  const review = e.target.closest('[data-review]'); if (review) { if (!isManagerRole()) return; const r = requests.find(x => x.id === review.dataset.review); if (!r || !managesPerson(mePerson(), person(r.person))) { toast('You can only decide requests for your team.'); return; } openModal({kind:'review', id:review.dataset.review}); return; }
   const cancel = e.target.closest('[data-cancel]'); if (cancel) {
     const r = requests.find(x => x.id === cancel.dataset.cancel);
     if (r?.person === me && r.status === 'pending') {
@@ -383,12 +390,12 @@ app.addEventListener('click', async e => {
     }
     return;
   }
-  const delHoliday = e.target.closest('[data-deleteholiday]'); if (delHoliday && role === 'manager') {
+  const delHoliday = e.target.closest('[data-deleteholiday]'); if (delHoliday && isManagerRole()) {
     if (!confirm(`Delete holiday on ${delHoliday.dataset.deleteholiday}?`)) return;
     try { await save('/api/holidays-delete', {date: delHoliday.dataset.deleteholiday}); openModal({kind:'manageholidays'}); toast('Holiday deleted.'); } catch (err) { toast(err.message); }
     return;
   }
-  const editHoliday = e.target.closest('[data-editholiday]'); if (editHoliday && role === 'manager') { openModal({kind:'editholiday', date:editHoliday.dataset.editholiday}); return; }
+  const editHoliday = e.target.closest('[data-editholiday]'); if (editHoliday && isManagerRole()) { openModal({kind:'editholiday', date:editHoliday.dataset.editholiday}); return; }
   const date = e.target.closest('[data-date]'); if (date) { selectedDay = date.dataset.date; month = new Date(parseDate(selectedDay).getFullYear(), parseDate(selectedDay).getMonth(), 1); render(); return; }
   const button = e.target.closest('[data-action]'); if (!button) return;
   if (button.dataset.action === 'close') { if (e.target === button || button.tagName === 'BUTTON') closeModal(); return; }
@@ -403,9 +410,9 @@ app.addEventListener('click', async e => {
   }
   if (button.dataset.action === 'exportcsv') { exportCsv(); return; }
   if (button.dataset.action === 'exportics') { exportIcs(); return; }
-  if (button.dataset.action === 'addholiday' && role === 'manager') { openModal({kind:'addholiday'}); return; }
-  if (button.dataset.action === 'manageholidays' && role === 'manager') { openModal({kind:'manageholidays'}); return; }
-  if (button.dataset.action === 'loadontario' && role === 'manager') {
+  if (button.dataset.action === 'addholiday' && isManagerRole()) { openModal({kind:'addholiday'}); return; }
+  if (button.dataset.action === 'manageholidays' && isManagerRole()) { openModal({kind:'manageholidays'}); return; }
+  if (button.dataset.action === 'loadontario' && isManagerRole()) {
     const y = Number(button.dataset.year);
     try {
       for (const h of ontarioHolidays(y)) {
@@ -418,14 +425,14 @@ app.addEventListener('click', async e => {
     } catch (err) { toast(err.message); }
     return;
   }
-  if (button.dataset.action === 'rollover' && role === 'manager') {
+  if (button.dataset.action === 'rollover' && isManagerRole()) {
     if (!confirm('Reset carry-in (profiles.used) to 0 for your team? Carry-over policy is 0 — unused vacation does not roll forward. Approved leave history is kept.')) return;
     try { await save('/api/rollover', {}); render(); toast('Carry-in reset for your team.'); } catch (err) { toast(err.message); }
     return;
   }
   if (button.dataset.action === 'queue') { view = 'requests'; render(); return; }
-  if (button.dataset.action === 'adduser' && role === 'manager') { openModal({kind:'adduser'}); return; }
-  if (button.dataset.action === 'resetpassword' && role === 'manager' && modal?.kind === 'edituser') {
+  if (button.dataset.action === 'adduser' && isAdmin()) { openModal({kind:'adduser'}); return; }
+  if (button.dataset.action === 'resetpassword' && isAdmin() && modal?.kind === 'edituser') {
     const p = person(modal.id);
     if (!p?.email) { setError('This user has no email on file.'); return; }
     if (p.active === false) { setError('Reactivate the user before sending a password reset link.'); return; }
@@ -435,10 +442,13 @@ app.addEventListener('click', async e => {
       const redirectTo = location.href.split(/[?#]/)[0];
       const {error} = await supabase.auth.resetPasswordForEmail(p.email, {redirectTo});
       if (error) throw Error(error.message);
-      openModal({kind:'edituser', id:modal.id, resetSent:true});
+      modal = {...modal, resetSent:true};
+      const box = document.getElementById('resetfeedback');
+      if (box) box.innerHTML = `<div class="okbox" role="status">Password reset link sent to ${escapeHtml(p.email)}. They can set a new password from the email link (no temporary password).</div>`;
       toast('Password reset email sent.');
     } catch (err) {
       setError(err.message);
+    } finally {
       button.disabled = false;
     }
     return;
@@ -508,7 +518,7 @@ app.addEventListener('submit', async e => {
   }
   if (e.target.id === 'decisionform') {
     e.preventDefault(); const f = e.target, decision = e.submitter?.value, r = requests.find(x => x.id === modal.id), note = f.elements.decisionNote.value.trim();
-    if (!r || r.status !== 'pending' || role !== 'manager') return;
+    if (!r || r.status !== 'pending' || !isManagerRole()) return;
     if (!managesPerson(mePerson(), person(r.person))) { setError('You can only decide requests for your team.'); return; }
     if (decision === 'declined' && !note) { setError('Add a short reason before declining.'); return; }
     if (decision === 'approved' && riskFor(r).length && !f.elements.override?.checked) { setError('Confirm that coverage is arranged before approving this conflict.'); return; }
