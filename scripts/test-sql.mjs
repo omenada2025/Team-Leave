@@ -44,6 +44,15 @@ assert('hotfix reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.test
 assert('hotfix admin gate', /if not is_admin\(\)/i.test(hotfix));
 assert('hotfix promotes Daniela to admin', /role = 'admin'/.test(hotfix) && /rdaniglad@gmail\.com/.test(hotfix));
 
+const liveHotfix = readFileSync(join(dir, 'hotfix_live_rpcs.sql'), 'utf8');
+assert('live hotfix has is_invited_email', /create or replace function public\.is_invited_email/i.test(liveHotfix));
+assert('live hotfix grants is_invited_email to anon', /grant execute on function public\.is_invited_email\(text\) to anon/i.test(liveHotfix));
+assert('live hotfix has upsert_profile p_active', /p_active boolean default true/i.test(liveHotfix));
+assert('live hotfix has set_profile_active', /create or replace function public\.set_profile_active/i.test(liveHotfix));
+assert('live hotfix has is_admin', /create or replace function public\.is_admin/i.test(liveHotfix));
+assert('live hotfix reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.test(liveHotfix));
+assert('live hotfix promotes Daniela to admin', /role = 'admin'/.test(liveHotfix) && /rdaniglad@gmail\.com/.test(liveHotfix));
+
 const seed = readFileSync(join(dir, 'seed_ontario_holidays.sql'), 'utf8');
 assert('seed has 2027', /2027-01-01/.test(seed));
 assert('seed has 2028', /2028-01-01/.test(seed));

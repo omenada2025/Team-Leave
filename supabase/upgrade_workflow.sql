@@ -8,7 +8,9 @@
 -- admin role (Users page + user-admin RPCs; managers keep leave approval).
 --
 -- If Edit user → Save fails with "Could not find ... upsert_profile(...p_active...)",
--- prefer this full upgrade. For a Save-only emergency paste, see hotfix_upsert_profile.sql.
+-- or Create password fails with "Could not find ... is_invited_email...",
+-- prefer this full upgrade. For a smaller invite/Users emergency paste, see
+-- hotfix_live_rpcs.sql (supersedes hotfix_upsert_profile.sql).
 
 alter table public.profiles add column if not exists team text not null default 'General';
 alter table public.profiles add column if not exists manager_email text;
