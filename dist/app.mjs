@@ -21,6 +21,7 @@ let requests = [];
 let notifications = [];
 let holidayRows = [];
 let coverageConfigured = null; // null → formula
+let lastRolloverAt = null;
 let me = null;
 let loading = true;
 let loadError = '';
@@ -29,13 +30,29 @@ let authMode = 'signin';
 /** True while the user arrived via a password-reset email link. */
 let passwordRecovery = false;
 let recoveryError = '';
+/** Brief success screen after Save new password. */
+let passwordSavedOk = false;
 let role = 'employee', view = 'overview', modal = null;
 let requestFilter = 'all';
+let userListFilter = 'all';
+let userSearch = '';
+/** Admin-only map: profile id → whether Auth user exists (best-effort). */
+let authStatusById = {};
+/** Highlight a row after submit / notification deep-link. */
+let highlightRequestId = null;
 let month = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
 let selectedDay = iso(new Date());
 let lastFocusEl = null;
 let realtimeChannel = null;
 let pollTimer = null;
+const inviteLink = (email) => {
+  const base = location.href.split(/[?#]/)[0];
+  return email ? `${base}?email=${encodeURIComponent(email)}` : base;
+};
+const readInviteEmail = () => {
+  try { return (new URLSearchParams(location.search || '').get('email') || '').trim().toLowerCase(); }
+  catch (_) { return ''; }
+};
 const isAdmin = () => role === 'admin';
 const isManagerRole = () => role === 'manager' || role === 'admin';
 const roleLabel = r => r === 'admin' ? 'Admin' : r === 'manager' ? 'Manager' : 'Employee';
@@ -110,35 +127,57 @@ async function loadState() {
   const [
     {data:leave, error:requestError},
     {data:holidayData},
-    {data:noticeRows},
+    noticeRes,
     settingsRes
   ] = await Promise.all([
     supabase.from('leave_requests').select('id,person,start,end,type,portion,status,note,decision_note,submitted,decided,decided_by').order('submitted', {ascending:false}),
     supabase.from('holidays').select('date,name,region').order('date'),
-    supabase.from('notifications').select('id,title,message,read,created_at').order('created_at', {ascending:false}).limit(25),
-    supabase.from('team_settings').select('minimum_coverage').eq('id', 1).maybeSingle()
+    supabase.from('notifications').select('id,title,message,read,created_at,request_id').order('created_at', {ascending:false}).limit(25),
+    supabase.from('team_settings').select('minimum_coverage,last_rollover_at').eq('id', 1).maybeSingle()
   ]);
+  let noticeRows = noticeRes.data;
+  if (noticeRes.error && /request_id/i.test(noticeRes.error.message || '')) {
+    const fallback = await supabase.from('notifications').select('id,title,message,read,created_at').order('created_at', {ascending:false}).limit(25);
+    noticeRows = fallback.data;
+  }
+  let settingsData = settingsRes.data;
+  if (settingsRes.error && /last_rollover/i.test(settingsRes.error.message || '')) {
+    const fallback = await supabase.from('team_settings').select('minimum_coverage').eq('id', 1).maybeSingle();
+    settingsData = fallback.data;
+  }
   const peopleError = profilesRes.error;
   const profiles = (profilesRes.data || []).map(p => ({...p, active: p.active !== false}));
   if (peopleError || requestError) throw Error(peopleError?.message || requestError?.message);
   const email = session.user.email.toLowerCase();
   const current = profiles.find(p => p.email.toLowerCase() === email);
-  if (!current) throw Error('Your account has not been added to this team. Ask the manager to add your email address.');
-  if (current.active === false) throw Error('Your account is deactivated. Ask a manager to reactivate you.');
-  const configured = settingsRes.error ? null : (settingsRes.data?.minimum_coverage ?? null);
+  if (!current) throw Error('Your account has not been added to this team. Ask an admin to add your email address.');
+  if (current.active === false) throw Error('Your account is deactivated. Ask an admin to reactivate you.');
+  const configured = settingsData?.minimum_coverage ?? null;
+  lastRolloverAt = settingsData?.last_rollover_at || null;
   const activeCount = profiles.filter(p => p.active !== false).length;
   const min = configured != null ? configured : Math.max(1, activeCount - 2);
   hydrate({
     people: profiles,
     requests: (leave || []).map(r => ({...r, decisionNote: r.decision_note || ''})),
     holidays: holidayData || [],
-    notifications: noticeRows || [],
+    notifications: (noticeRows || []).map(n => ({...n, requestId: n.request_id || null})),
     me: current.id,
     role: current.role,
     minimumCoverage: min,
     coverageConfigured: configured
   });
   if (view === 'users' && !isAdmin()) view = 'overview';
+  if (isAdmin()) await loadAuthStatus();
+}
+
+/** Best-effort Auth presence for Users list — no service-role key required. */
+async function loadAuthStatus() {
+  authStatusById = {};
+  const {data, error} = await supabase.rpc('list_profile_auth_status');
+  if (error || !Array.isArray(data)) return; // RPC missing until upgrade — hide badges
+  for (const row of data) {
+    if (row?.id) authStatusById[row.id] = !!row.has_auth;
+  }
 }
 
 function stopLive() {
@@ -214,6 +253,8 @@ async function establishSessionFromUrl() {
 
 async function load() {
   try {
+    const inviteEmail = readInviteEmail();
+    if (inviteEmail && !session) authMode = 'signup';
     if (hasRecoveryIntent()) passwordRecovery = true;
     session = await establishSessionFromUrl();
     if (parseAuthUrl().hasAuthPayload || parseAuthUrl().looksRecovery) scrubAuthParamsFromUrl();
@@ -245,7 +286,21 @@ const avatar = (p, small = false) => `<span class="avatar ${small ? 'small' : ''
 const badge = status => `<span class="badge ${status}"><i></i>${status[0].toUpperCase() + status.slice(1)}</span>`;
 const icon = name => ({overview:'◫', requests:'▤', calendar:'▦', reports:'▥', users:'♙'}[name]);
 const riskFor = r => r.type === 'Work From Home' ? [] : coverageFor(r.start, r.end, requests, r.person, r.id).filter(d => d.conflict);
-const requestOrder = (a, b) => (a.status === 'pending' ? 0 : 1) - (b.status === 'pending' ? 0 : 1) || a.start.localeCompare(b.start);
+const requestOrder = (a, b) => {
+  const pendingA = a.status === 'pending' ? 0 : 1, pendingB = b.status === 'pending' ? 0 : 1;
+  if (pendingA !== pendingB) return pendingA - pendingB;
+  const riskA = a.status === 'pending' ? riskFor(a).length : 0;
+  const riskB = b.status === 'pending' ? riskFor(b).length : 0;
+  if (riskB !== riskA) return riskB - riskA;
+  return a.start.localeCompare(b.start);
+};
+const authBadge = (p) => {
+  if (p.active === false) return '';
+  if (!(p.id in authStatusById)) return '';
+  return authStatusById[p.id]
+    ? '<span class="authbadge hasauth" title="Has a Supabase Auth account">Has Auth</span>'
+    : '<span class="authbadge awaiting" title="Profile only — never created a password">Never signed in</span>';
+};
 
 function trapFocus(dialog) {
   const focusables = [...dialog.querySelectorAll('button, [href], input, select, textarea, [tabindex]:not([tabindex="-1"])')].filter(el => !el.disabled);
@@ -290,8 +345,8 @@ function shell(content) {
     <aside class="sidebar"><div class="brand"><span class="brandmark"><b></b><b></b><b></b><b></b></span><span>team<span class="brandlight">leave</span></span></div>
       <div class="navlabel">WORKSPACE</div><nav aria-label="Main navigation">
       ${['overview','requests','calendar',...(isManagerRole() ? ['reports'] : []),...(isAdmin() ? ['users'] : [])].map(v => `<button class="navitem ${view === v ? 'active' : ''}" data-view="${v}" ${view === v ? 'aria-current="page"' : ''}><span class="navicon">${icon(v)}</span>${v === 'calendar' ? 'Team calendar' : v[0].toUpperCase() + v.slice(1)}${v === 'requests' && isManagerRole() && pending ? `<span class="navcount">${pending}</span>` : ''}</button>`).join('')}
-      </nav><div class="sidebottom"><button class="textbtn" data-action="password">Change password</button><button class="textbtn" data-action="signout">Sign out</button></div>
-    </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view === 'calendar' ? 'Team calendar' : view[0].toUpperCase() + view.slice(1)}</div><div class="toptools"><button class="noticebutton" data-action="notifications" aria-label="${notices ? `Notifications, ${notices} unread` : 'Notifications'}">◔${notices ? `<b>${notices}</b>` : ''}</button><span class="private"><span class="lock">●</span> Private team</span><span class="private">${escapeHtml(mine()?.name || 'Team member')} · ${role}</span>${mine() ? avatar(mine(), true) : ''}</div></header>
+      </nav><div class="sidebottom"><button class="textbtn" data-action="password">Change password</button><button class="textbtn" data-action="signout">Sign out</button><button class="textbtn" data-action="help">How it works</button></div>
+    </aside><div class="workspace"><header class="topbar"><div class="mobilebrand">team<span>leave</span></div><div class="breadcrumb">Workspace <span>/</span> ${view === 'calendar' ? 'Team calendar' : view[0].toUpperCase() + view.slice(1)}</div><div class="toptools"><button class="noticebutton" data-action="notifications" aria-label="${notices ? `Notifications, ${notices} unread` : 'Notifications'}">◔${notices ? `<b>${notices}</b>` : ''}</button><div class="mobileaccount" role="group" aria-label="Account"><button class="textbtn" data-action="password">Password</button><button class="textbtn" data-action="signout">Sign out</button></div><span class="private"><span class="lock">●</span> Private team</span><span class="private">${escapeHtml(mine()?.name || 'Team member')} · ${role}</span>${mine() ? avatar(mine(), true) : ''}</div></header>
     <main class="main">${content}</main></div></div>${modal ? renderModal() : ''}<div id="toast" role="status" aria-live="polite"></div>`;
 }
 
@@ -304,7 +359,8 @@ function overview() {
   const head = activePeople().length;
   return `<div class="pageheading"><div><div class="eyebrow">${isManagerRole() ? 'TEAM OVERVIEW' : 'YOUR TIME OFF'}</div><h1>${isManagerRole() ? 'A clearer view of time away.' : 'Make room for time away.'}</h1><p>${isManagerRole() ? 'Review requests, protect coverage, and keep everyone in the loop.' : 'Your leave balance, requests, and team plans in one place.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
   <section class="hero"><div class="herotext"><span class="heroeyebrow">${isManagerRole() ? 'TEAM LEAVE / ' + new Date().getFullYear() : 'YOUR LEAVE / ' + new Date().getFullYear()}</span><h2>${isManagerRole() ? 'Plan together.<br>Stay covered.' : 'Time off looks<br>good on you.'}</h2><p>${isManagerRole() ? 'The team’s next decisions and availability, at a glance.' : 'You have ' + balance.available + ' days available to plan this year.'}</p><button class="whitebutton" data-action="${isManagerRole() ? 'queue' : 'new'}">${isManagerRole() ? 'Review requests' : 'Plan time off'} <span>↗</span></button></div><div class="heroart"><div class="artcircle one"></div><div class="artcircle two"></div><div class="artcard"><div class="artrow"><span class="artsun">✳</span><span>TIME TO RESET</span></div><div class="artdays">${isManagerRole() ? pending.length : balance.available}<span>${isManagerRole() ? 'to review' : 'days left'}</span></div><div class="artline"><span></span><span></span><span></span></div></div></div></section>
-  <section class="stats" aria-label="At a glance"><div class="stat"><div class="stathead"><span>Available to use</span><span class="statglyph lavender">✳</span></div><strong>${balance.available}<small> days</small></strong><div class="statfoot">Your ${new Date().getFullYear()} vacation balance</div></div><div class="stat"><div class="stathead"><span>${isManagerRole() ? 'Awaiting your review' : 'Your pending requests'}</span><span class="statglyph peach">◷</span></div><strong>${isManagerRole() ? pending.length : requests.filter(r => r.status === 'pending' && r.person === me).length}<small> requests</small></strong><div class="statfoot">${isManagerRole() ? 'Decision needed' : 'Waiting for manager approval'}</div></div><div class="stat"><div class="stathead"><span>Team away today</span><span class="statglyph mint">◉</span></div><strong>${awayNow}<small> people</small></strong><div class="statfoot">${head - awayNow} of ${head} available</div></div></section>
+  <section class="stats" aria-label="At a glance"><div class="stat"><div class="stathead"><span>Available to use</span><span class="statglyph lavender">✳</span></div><strong>${balance.available}<small> days</small></strong><div class="statfoot">Your ${new Date().getFullYear()} vacation balance</div></div><div class="stat"><div class="stathead"><span>${isManagerRole() ? 'Awaiting your review' : 'Your pending requests'}</span><span class="statglyph peach">◷</span></div><strong>${isManagerRole() ? pending.length : requests.filter(r => r.status === 'pending' && r.person === me).length}<small> requests</small></strong><div class="statfoot">${isManagerRole() ? 'Aim to respond within 2 business days' : 'Waiting for manager approval'}</div></div><div class="stat"><div class="stathead"><span>Team away today</span><span class="statglyph mint">◉</span></div><strong>${awayNow}<small> people</small></strong><div class="statfoot">${head - awayNow} of ${head} available</div></div></section>
+  <p class="glossaryhint"><b>Vacation</b> burns annual days. <b>Work From Home</b>, Sick, Personal, and Unpaid do not — WFH also skips coverage impact.</p>
   <div class="overviewgrid"><section class="panel"><div class="sectionhead"><div><span class="eyebrow">COMING UP</span><h3>Upcoming absences</h3></div><button class="linkbutton" data-view="calendar">View calendar <span>→</span></button></div>${soon.length ? `<div class="absence-list">${soon.map(r => `<div class="absence">${avatar(person(r.person))}<div class="absenceperson"><b>${escapeHtml(person(r.person)?.name || 'Teammate')}</b><span>${typeLabel(r)} · ${daysLabel(requestDuration(r))}</span></div><time>${range(r)}</time></div>`).join('')}</div>` : '<div class="empty">No upcoming approved time off yet.</div>'}</section>
   <section class="panel coveragepanel"><div class="sectionhead"><div><span class="eyebrow">COVERAGE WATCH</span><h3>Needs a closer look</h3></div><span class="countpill">${risks.length} ${risks.length === 1 ? 'conflict' : 'conflicts'}</span></div>${risks.length ? risks.slice(0, 2).map(({r, days}) => `<div class="riskitem"><span class="riskicon">!</span><div><b>${escapeHtml(person(r.person)?.name || '')} · ${range(r)}</b><p>${daysLabel(days.length)} below ${minimumCoverage}-person minimum if approved. ${days[0].available} available on ${pretty(days[0].date)}.</p>${isManagerRole() ? `<button class="smalllink" data-review="${r.id}">Review request →</button>` : ''}</div></div>`).join('') : '<div class="goodstate"><span>✓</span><div><b>Coverage looks healthy</b><p>No pending requests currently fall below your team minimum.</p></div></div>'}<div class="coveragefoot">Based on approved leave · minimum ${minimumCoverage} of ${head} available</div></section></div>`;
 }
@@ -314,7 +370,14 @@ function requestRows(items, manager) {
   return `<div class="tablewrap"><table><thead><tr>${manager ? '<th>Employee</th>' : ''}<th>Dates</th><th>Duration</th><th>Status</th>${manager ? '<th>Coverage</th>' : ''}<th class="right">Action</th></tr></thead><tbody>${items.map(r => {
     const risks = r.status === 'pending' ? riskFor(r) : [];
     const p = person(r.person);
-    return `<tr>${manager ? `<td><div class="cellperson">${p ? avatar(p, true) : ''}<b>${escapeHtml(p?.name || 'Unknown')}</b></div></td>` : ''}<td><b>${range(r)}</b><span class="cellsub">${typeLabel(r)}</span></td><td>${daysLabel(requestDuration(r))}</td><td>${badge(r.status)}${r.decisionNote ? `<span class="cellsub decisionnote">${escapeHtml(r.decisionNote)}</span>` : ''}</td>${manager ? `<td>${risks.length ? `<span class="impact caution">⚠ ${daysLabel(risks.length)} at risk</span>` : '<span class="impact good">✓ Covered</span>'}</td>` : ''}<td class="right">${manager && r.status === 'pending' && r.person !== me ? `<button class="rowaction" data-review="${r.id}">Review →</button>` : !manager && r.status === 'pending' ? `<button class="rowaction" data-editrequest="${r.id}">Edit</button> <button class="rowaction muted" data-cancel="${r.id}">Cancel</button>` : '<span class="dash">—</span>'}</td></tr>`;
+    const ownPending = r.status === 'pending' && r.person === me;
+    const canReview = manager && r.status === 'pending' && r.person !== me;
+    const action = canReview
+      ? `<button class="rowaction" data-review="${r.id}">Review →</button>`
+      : ownPending
+        ? `<button class="rowaction" data-editrequest="${r.id}">Edit</button> <button class="rowaction muted" data-cancel="${r.id}">Cancel</button>`
+        : '<span class="dash">—</span>';
+    return `<tr class="${highlightRequestId === r.id ? 'rowhighlight' : ''}" data-request-row="${r.id}">${manager ? `<td><div class="cellperson">${p ? avatar(p, true) : ''}<b>${escapeHtml(p?.name || 'Unknown')}</b></div></td>` : ''}<td><b>${range(r)}</b><span class="cellsub">${typeLabel(r)}</span></td><td>${daysLabel(requestDuration(r))}</td><td>${badge(r.status)}${r.decisionNote ? `<span class="cellsub decisionnote">${escapeHtml(r.decisionNote)}</span>` : ''}</td>${manager ? `<td>${risks.length ? `<span class="impact caution">⚠ ${daysLabel(risks.length)} at risk</span>` : '<span class="impact good">✓ Covered</span>'}</td>` : ''}<td class="right">${action}</td></tr>`;
   }).join('')}</tbody></table></div>`;
 }
 
@@ -323,8 +386,9 @@ function requestsPage() {
   const list = source.filter(r => requestFilter === 'all' || r.status === requestFilter).sort(requestOrder);
   const pending = list.filter(r => r.status === 'pending' && (!isManagerRole() || r.person !== me)).length;
   const b = remaining(me, requests);
-  return `<div class="pageheading"><div><div class="eyebrow">${isManagerRole() ? 'APPROVALS' : 'MY REQUESTS'}</div><h1>${isManagerRole() ? 'Requests & decisions' : 'Your requests'}</h1><p>${isManagerRole() ? 'You only see and decide requests for your team (same team name or people who list your email as manager).' : 'Submit time off and follow each request through to a decision.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
-  ${role === 'employee' ? `<section class="balancebar"><div><span class="eyebrow">${new Date().getFullYear()} VACATION</span><strong>${b.available} <small>days available</small></strong></div><div class="balanceitems"><span><b>${b.allowance}</b> annual</span><span><b>${b.used}</b> carry-in</span><span><b>${b.approved}</b> approved Vacation</span><span><b>${b.pending}</b> pending Vacation</span></div></section>` : `<div class="queueintro"><span class="queueicon">◷</span><div><b>${pending} ${pending === 1 ? 'request needs' : 'requests need'} a decision</b><span>Coverage warnings use a ${minimumCoverage}-person minimum${coverageConfigured == null ? ' (auto: headcount − 2)' : ''}.</span></div></div>`}
+  return `<div class="pageheading"><div><div class="eyebrow">${isManagerRole() ? 'APPROVALS' : 'MY REQUESTS'}</div><h1>${isManagerRole() ? 'Requests & decisions' : 'Your requests'}</h1><p>${isManagerRole() ? 'You only see and decide requests for your team (same team name or people who list your email as manager). Habit: open Requests each morning — notifications are in-app only (badge refreshes about every 45s). Aim to respond within 2 business days.' : 'Submit time off and follow each request through to a decision.'}</p></div><button class="primary topaction" data-action="new">+ &nbsp;Request time off</button></div>
+  <section class="balancebar"><div><span class="eyebrow">${new Date().getFullYear()} VACATION</span><strong>${b.available} <small>days available</small></strong></div><div class="balanceitems"><span><b>${b.allowance}</b> annual</span><span><b>${b.used}</b> carry-in</span><span><b>${b.approved}</b> approved Vacation</span><span><b>${b.pending}</b> pending Vacation</span></div></section>
+  ${isManagerRole() ? `<div class="queueintro"><span class="queueicon">◷</span><div><b>${pending} ${pending === 1 ? 'request needs' : 'requests need'} a decision</b><span>Coverage warnings use a ${minimumCoverage}-person minimum${coverageConfigured == null ? ' (auto: headcount − 2)' : ''}. Your own pending requests show Edit / Cancel below.</span></div></div>` : ''}
   <section class="panel requestspanel"><div class="sectionhead"><div><span class="eyebrow">${isManagerRole() ? 'YOUR TEAM' : 'HISTORY'}</span><h3>${isManagerRole() ? 'Team requests' : 'All your requests'}</h3></div><div class="filtertabs">${['all','pending','approved','declined','cancelled'].map(s => `<button class="${requestFilter === s ? 'active' : ''}" data-filter="${s}">${s[0].toUpperCase() + s.slice(1)}</button>`).join('')}</div></div>${requestRows(list, isManagerRole())}</section>`;
 }
 
@@ -343,7 +407,7 @@ function calendarPage() {
     const hName = holidays.includes(date) ? holidayName(date) : '';
     const label = `${longDate(date)}${hName ? `, ${hName}` : ''}, ${events.length} approved absences`;
     return `<button class="calday ${active ? '' : 'outside'} ${selectedDay === date ? 'chosen' : ''} ${date === iso(new Date()) ? 'todaydate' : ''}" data-date="${date}" aria-label="${escapeHtml(label)}"><span class="daynum">${d.getDate()}</span><span class="calentries">${events.slice(0, 2).map(r => `<span class="calentry" style="--event:${person(r.person)?.color || '#d6e3ff'}">${escapeHtml((person(r.person)?.name || '').split(' ')[0])}</span>`).join('')}${events.length > 2 ? `<span class="moreevents">+${events.length - 2} more</span>` : ''}${hName ? `<span class="holidaydot" title="${escapeHtml(hName)}">${escapeHtml(hName)}</span>` : ''}${waits.length ? `<span class="pendingdot" title="${waits.length} pending">· ${waits.length} pending</span>` : ''}</span></button>`;
-  }).join('')}</div><div class="callegend"><span><i class="legendapproved"></i>Approved</span><span><i class="legendpending"></i>Pending</span></div></section>
+  }).join('')}</div><div class="callegend"><span><i class="legendapproved"></i>Approved</span><span><i class="legendpending"></i>Pending</span><span class="callegendhint">On mobile, tap a day to see names</span></div></section>
   <aside class="panel daypanel"><span class="eyebrow">DAILY SNAPSHOT</span><h3>${longDate(selectedDay)}</h3>${dayHoliday ? `<div class="holidayflag">${escapeHtml(dayHoliday)}</div>` : ''}<div class="coveragefigure"><strong>${availability ? availability.available : head}<small> / ${head}</small></strong><span>available to work</span></div><div class="meter"><span style="width:${(availability ? availability.available : head) / Math.max(1, head) * 100}%"></span></div><p class="threshold ${availability?.conflict ? 'at-risk' : ''}">${availability?.conflict ? '⚠ Below coverage minimum' : `✓ Minimum ${minimumCoverage} people covered`}</p><div class="daydivider"></div><h4>Away that day <span>${chosen.length}</span></h4>${chosen.length ? chosen.map(r => `<div class="dayperson">${avatar(person(r.person), true)}<div><b>${escapeHtml(person(r.person)?.name || '')}</b><span>${typeLabel(r)} · ${range(r)}</span></div></div>`).join('') : '<p class="quiet">Nobody is away on approved leave.</p>'}${pendingOnDay.length ? `<h4 class="pendingtitle">Pending <span>${pendingOnDay.length}</span></h4>${pendingOnDay.map(r => `<div class="dayperson">${avatar(person(r.person), true)}<div><b>${escapeHtml(person(r.person)?.name || '')}</b><span>Awaiting approval</span></div></div>`).join('')}` : ''}</aside></div>`;
 }
 
@@ -352,41 +416,78 @@ function reportsPage() {
   const used = approved.reduce((n, r) => n + balanceDuration(r), 0);
   const teams = [...new Set(people.map(p => p.team || 'General'))];
   const formula = Math.max(1, activePeople().length - 2);
+  const meP = mePerson();
+  const utilPeople = isAdmin()
+    ? people.filter(p => p.active !== false)
+    : people.filter(p => p.active !== false && (p.id === me || managesPerson(meP, p)));
+  const pendingVacation = teamRequests().filter(r => r.status === 'pending' && r.type === 'Vacation' && r.person !== me);
+  const rolloverNote = lastRolloverAt
+    ? `Last rollover: ${new Date(lastRolloverAt).toLocaleString('en-CA', {dateStyle:'medium', timeStyle:'short'})}.`
+    : 'No rollover timestamp recorded yet (run upgrade SQL to track it).';
   return `<div class="pageheading"><div><div class="eyebrow">TEAM INSIGHTS</div><h1>Leave reports</h1><p>Balances, utilization, holidays, and year-end checklist for ${new Date().getFullYear()}.</p></div><div class="reportactions"><button class="secondary" data-action="manageholidays">Manage holidays</button><button class="secondary" data-action="exportics">Export calendar</button><button class="primary" data-action="exportcsv">Export CSV</button></div></div>
+  <p class="quiet exportnote">CSV includes all statuses. ICS export is <b>approved</b> leave only.</p>
   <section class="stats"><div class="stat"><div class="stathead"><span>Approved leave</span></div><strong>${used}<small> days</small></strong></div><div class="stat"><div class="stathead"><span>Pending decisions</span></div><strong>${pendingTeamCount()}<small> requests</small></strong></div><div class="stat"><div class="stathead"><span>Teams</span></div><strong>${teams.length}<small> groups</small></strong></div></section>
   <section class="panel reportpanel"><div class="sectionhead"><div><span class="eyebrow">COVERAGE</span><h3>Minimum people available</h3></div></div>
   <form id="coverageform" class="inlineform"><label>Minimum coverage <span class="optional">Leave blank for auto (${formula})</span><input name="minimum" type="number" min="1" max="${activePeople().length}" value="${coverageConfigured ?? ''}" placeholder="${formula}"></label><button class="secondary" type="submit">Save coverage</button></form>
   <p class="quiet">Current effective minimum: <b>${minimumCoverage}</b>${coverageConfigured == null ? ' (auto: active headcount − 2)' : ' (configured)'}.</p></section>
   <section class="panel reportpanel"><div class="sectionhead"><div><span class="eyebrow">YEAR END</span><h3>Leave-year checklist</h3></div></div>
-  <ol class="checklist"><li>Confirm all pending Vacation for this year is decided.</li><li>Export CSV / ICS for records if needed.</li><li>Carry-over policy defaults to <b>0</b> — unused vacation does not roll into next year.</li><li>Run rollover to reset carry-in (<code>profiles.used</code>) to 0 for your team.</li></ol>
+  <ol class="checklist"><li>Confirm all pending Vacation for this year is decided${pendingVacation.length ? ` — <b class="dangertext">${pendingVacation.length} still pending</b>` : ''}.</li><li>Export CSV / ICS for records if needed.</li><li>Carry-over policy defaults to <b>0</b> — unused vacation does not roll into next year.</li><li>Run rollover to reset carry-in (<code>profiles.used</code>) to 0 for your team.</li></ol>
+  <p class="quiet">${rolloverNote}</p>
   <button class="secondary" data-action="rollover">Reset carry-in for my team (carry-over = 0)</button>
-  <p class="quiet">Approved Vacation history is not deleted. Only the manual carry-in field is cleared.</p></section>
-  <section class="panel reportpanel"><div class="sectionhead"><div><span class="eyebrow">BALANCES</span><h3>Team utilization</h3></div></div><div class="reportrows">${people.filter(p => p.active !== false).map(p => { const b = remaining(p.id, requests), pct = Math.min(100, Math.round((b.used + b.approved) / Math.max(1, b.allowance) * 100)); return `<div class="reportrow"><div>${avatar(p, true)}<span><b>${escapeHtml(p.name)}</b><small>${escapeHtml(p.team || 'General')}</small></span></div><div class="reportbar"><i style="width:${pct}%"></i></div><strong>${b.used + b.approved} / ${b.allowance}</strong></div>`; }).join('')}</div></section>`;
+  <p class="quiet">Approved Vacation history is not deleted. Only the manual carry-in field is cleared. Do not run rollover early while Vacation requests are still pending.</p></section>
+  <section class="panel reportpanel"><div class="sectionhead"><div><span class="eyebrow">BALANCES</span><h3>Team utilization</h3></div></div>
+  <p class="quiet">${isAdmin() ? 'Showing all active profiles.' : 'Showing your team only (same team or people who list you as manager).'}</p>
+  <div class="reportrows">${utilPeople.map(p => { const b = remaining(p.id, requests), pct = Math.min(100, Math.round((b.used + b.approved) / Math.max(1, b.allowance) * 100)); return `<div class="reportrow"><div>${avatar(p, true)}<span><b>${escapeHtml(p.name)}</b><small>${escapeHtml(p.team || 'General')}</small></span></div><div class="reportbar"><i style="width:${pct}%"></i></div><strong>${b.used + b.approved} / ${b.allowance}</strong></div>`; }).join('') || '<div class="empty">No teammates in scope.</div>'}</div></section>`;
 }
 
 function usersPage() {
   if (!isAdmin()) {
     return `<div class="pageheading"><div><div class="eyebrow">RESTRICTED</div><h1>Admin access required</h1><p>Only administrators can open Team users. Ask an admin if you need a profile change, allowance update, or password reset link.</p></div></div>
-    <section class="panel"><div class="okbox">You can still change your own password from the sidebar.</div></section>`;
+    <section class="panel"><div class="okbox">You can still change your own password from the sidebar (or Password on mobile).</div></section>`;
   }
+  const q = userSearch.trim().toLowerCase();
+  const filtered = people.filter(p => {
+    if (userListFilter === 'active' && p.active === false) return false;
+    if (userListFilter === 'deactivated' && p.active !== false) return false;
+    if (!q) return true;
+    return (p.name || '').toLowerCase().includes(q) || (p.email || '').toLowerCase().includes(q);
+  });
   return `<div class="pageheading"><div><div class="eyebrow">ACCOUNT & ACCESS</div><h1>Team users</h1><p>Admin-only: manage roles, leave balances, deactivate people, and send password reset links.</p></div><div class="reportactions"><button class="primary topaction" data-action="adduser">+ Add user</button></div></div>
-  <section class="panel userspanel"><div class="sectionhead"><div><span class="eyebrow">TEAM DIRECTORY</span><h3>${people.length} users</h3></div></div>
-  <div class="userlist">${people.map(p => `<div class="userrow ${p.active === false ? 'inactive' : ''}">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email || '')} · ${escapeHtml(p.team || 'General')}${p.active === false ? ' · Deactivated' : ''}</span></div><span class="userrole">${roleLabel(p.role)}</span><span class="userbalance"><b>${remaining(p.id, requests).available}</b> days available</span><button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button></div>`).join('')}</div></section>
-  <p class="userhint">Adding a user creates their team profile only. Ask them to open Team Leave and use Create password with that work email — never share a temporary password. Deactivating keeps leave history and blocks Create password / sign-in for that profile.</p>`;
+  <section class="panel userspanel"><div class="sectionhead"><div><span class="eyebrow">TEAM DIRECTORY</span><h3>${filtered.length} of ${people.length} users</h3></div>
+  <div class="filtertabs">${[['all','All'],['active','Active'],['deactivated','Deactivated']].map(([k,label]) => `<button class="${userListFilter === k ? 'active' : ''}" data-userfilter="${k}">${label}</button>`).join('')}</div></div>
+  <label class="usersearch">Search<input type="search" id="usersearch" value="${escapeHtml(userSearch)}" placeholder="Name or email" autocomplete="off"></label>
+  <div class="userlist">${filtered.map(p => {
+    const awaiting = p.active !== false && (p.id in authStatusById) && !authStatusById[p.id];
+    return `<div class="userrow ${p.active === false ? 'inactive' : ''}">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email || '')} · ${escapeHtml(p.team || 'General')}${p.active === false ? ' · Deactivated' : ''}</span>${authBadge(p)}</div><span class="userrole">${roleLabel(p.role)}</span><span class="userbalance"><b>${remaining(p.id, requests).available}</b> days available</span><div class="useractions">${awaiting ? `<button class="rowaction" data-resendinvite="${p.id}">Resend invite</button>` : ''}<button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button></div></div>`;
+  }).join('') || '<div class="empty">No users match this filter.</div>'}</div></section>
+  <p class="userhint">Adding a user creates their team profile only (role starts as Employee — promote later in Edit). Share the invite link with <code>?email=</code> so Create password is prefilled. Deactivating keeps leave history and blocks Create password / sign-in. Auth status badges need the live SQL upgrade (<code>list_profile_auth_status</code>).</p>`;
 }
 
 function renderModal() {
   if (modal.kind === 'invite') {
-    const link = location.href.split(/[?#]/)[0];
-    const body = `You have been added to Team Leave.\n\n1. Open: ${link}\n2. Choose Create password (or Sign in if you already have an account)\n3. Use this email: ${modal.email}\n\nCreate your own password — none is shared by email.`;
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PROFILE READY</div><h2>Invite them to create a password</h2><p class="dialoglead">Their work email is on the team. Share the app link — they create their own password. No temporary password is generated.</p><div class="requestnote"><span>ACCESS LINK</span><p>${escapeHtml(link)}</p><span>EMAIL</span><p>${escapeHtml(modal.email)}</p></div><div class="dialogactions"><button class="secondary" data-copy-invite="${encodeURIComponent(body)}">Copy invite</button><a class="primary mailbutton" href="mailto:${encodeURIComponent(modal.email)}?subject=${encodeURIComponent('Your Team Leave access')}&body=${encodeURIComponent(body)}">Open email</a><button class="primary" data-action="close">Done</button></div></div></div>`;
+    const link = inviteLink(modal.email);
+    const body = `You have been added to Team Leave.\n\n1. Open: ${link}\n2. Choose Create password (or Sign in if you already have an account)\n3. Your email is prefilled: ${modal.email}\n\nCreate your own password — none is shared by email.`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PROFILE READY</div><h2>Invite them to create a password</h2><p class="dialoglead">Their work email is on the team. Share the invite link (email is prefilled). They create their own password. No temporary password is generated.</p><div class="requestnote"><span>ACCESS LINK</span><p>${escapeHtml(link)}</p><span>EMAIL</span><p>${escapeHtml(modal.email)}</p></div><div class="dialogactions"><button class="secondary" data-copy-invite="${encodeURIComponent(body)}">Copy invite</button><a class="primary mailbutton" href="mailto:${encodeURIComponent(modal.email)}?subject=${encodeURIComponent('Your Team Leave access')}&body=${encodeURIComponent(body)}">Open email</a><button class="primary" data-action="close">Done</button></div></div></div>`;
+  }
+  if (modal.kind === 'help') {
+    return `<div class="scrim" data-action="close"><div class="dialog dialogwide" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ONBOARDING</div><h2>How Team Leave access works</h2><p class="dialoglead">English checklist for first-time access and password resets.</p>
+    <ol class="checklist">
+      <li><b>Admin adds</b> the person on Users → Add user (profile only, starts as Employee).</li>
+      <li><b>Share the invite link</b> (Copy invite / Open email). The link includes <code>?email=</code> so Create password is prefilled.</li>
+      <li>They open the app → <b>Create password</b> → then <b>Sign in</b>.</li>
+      <li><b>Forgot password</b> only works after they already created a password once. New invites use Create password, not Forgot.</li>
+      <li>If a reset email opens Sign in with no set-password screen, Auth URL Configuration in Supabase is wrong (see README / ops checklist).</li>
+      <li>Deactivated accounts: ask an <b>admin</b> to reactivate — managers cannot do this.</li>
+      <li>Managers: open <b>Requests</b> each morning. Notifications are in-app only (no email alerts).</li>
+    </ol>
+    <div class="dialogactions"><button class="primary" data-action="close">Got it</button></div></div></div>`;
   }
   if (modal.kind === 'password') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ACCOUNT SECURITY</div><h2>Change password</h2><p class="dialoglead">Use at least 8 characters. Your current session will stay signed in.</p><form id="passwordform"><label>New password<input name="password" type="password" minlength="8" autocomplete="new-password" required></label><label>Confirm password<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required></label><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Update password</button></div></form></div></div>`;
   if (modal.kind === 'resetconfirm') {
     const p = person(modal.id); if (!p) return '';
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PASSWORD RESET</div><h2>Send reset email?</h2><p class="dialoglead">Supabase will email a one-time link to this address. No temporary password is created.</p><div class="requestnote"><span>EMAIL</span><p>${escapeHtml(p.email)}</p></div><div class="requestnote"><span>REQUIREMENT</span><p>They must already have used Create password once. If they were only invited and never set a password, share the app link and ask them to use Create password instead.</p></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="backtoedituser">Back</button><button type="button" class="primary" data-action="confirmreset">Send reset email</button></div></div></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PASSWORD RESET</div><h2>Send reset email?</h2><p class="dialoglead">Supabase will email a one-time link to this address. No temporary password is created.</p><div class="requestnote"><span>EMAIL</span><p>${escapeHtml(p.email)}</p></div><div class="requestnote"><span>REQUIREMENT</span><p>They must already have used Create password once. If they were only invited and never set a password, share the invite link and ask them to use Create password instead.</p></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="backtoedituser">Back</button><button type="button" class="primary" data-action="confirmreset">Send reset email</button></div></div></div>`;
   }
-  if (modal.kind === 'notifications') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">UPDATES</div><h2>Notifications</h2><p class="dialoglead">In-app only — Team Leave does not send email.</p><div class="notificationlist">${notifications.length ? notifications.map(n => `<article class="notification ${n.read ? '' : 'unread'}"><b>${escapeHtml(n.title)}</b><p>${escapeHtml(n.message)}</p><time>${new Date(n.created_at).toLocaleString('en-CA', {dateStyle:'medium', timeStyle:'short'})}</time></article>`).join('') : '<div class="empty">You are all caught up.</div>'}</div></div></div>`;
+  if (modal.kind === 'notifications') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">UPDATES</div><h2>Notifications</h2><p class="dialoglead">In-app only — Team Leave does not send email. Tap an item to open the related request when available.</p><div class="notificationlist">${notifications.length ? notifications.map(n => `<button type="button" class="notification ${n.read ? '' : 'unread'}" data-open-notice="${n.id}" ${n.requestId ? `data-request="${n.requestId}"` : ''}><b>${escapeHtml(n.title)}</b><p>${escapeHtml(n.message)}</p><time>${new Date(n.created_at).toLocaleString('en-CA', {dateStyle:'medium', timeStyle:'short'})}</time></button>`).join('') : '<div class="empty">You are all caught up.</div>'}</div></div></div>`;
   if (modal.kind === 'manageholidays') {
     const year = new Date().getFullYear();
     return `<div class="scrim" data-action="close"><div class="dialog dialogwide" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">TEAM CALENDAR</div><h2>Holidays</h2><p class="dialoglead">Holidays are excluded from leave duration. Edit a row, delete, or load Ontario ESA holidays.</p>
@@ -405,9 +506,10 @@ function renderModal() {
       : modal.resetError
         ? `<div class="formerror" id="resetfeedback" role="alert">${escapeHtml(modal.resetError)}</div>`
         : `<div id="resetfeedback"></div>`;
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">Update role, team, leave balance, or send a password reset link.</p><form id="edituserform"><label>Email<input type="email" value="${escapeHtml(p.email || '')}" readonly tabindex="-1" aria-readonly="true"></label><p class="quiet">Email matches their Auth account and cannot be changed here.</p><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option><option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Admin</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
+    const awaiting = p.active !== false && (p.id in authStatusById) && !authStatusById[p.id];
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">Update role, team, leave balance, or send a password reset link.${authBadge(p) ? ` ${authBadge(p)}` : ''}</p><form id="edituserform"><label>Email<input type="email" value="${escapeHtml(p.email || '')}" readonly tabindex="-1" aria-readonly="true"></label><p class="quiet">Email matches their Auth account and cannot be changed here.</p><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option><option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Admin</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${awaiting ? `<p class="quiet">This person has never signed in — use Resend invite from the Users list, not Reset password.</p>` : ''}${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
   }
-  if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create their team profile. They will create their own password from the sign-in page.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
+  if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create their team profile (starts as Employee — you can promote them to Manager or Admin later in Edit). They create their own password from the sign-in page.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
   if (modal.kind === 'new' || modal.kind === 'editrequest') {
     const editing = modal.kind === 'editrequest', current = editing ? requests.find(x => x.id === modal.id) : null;
     if (editing && !current) return '';
@@ -421,7 +523,7 @@ function renderModal() {
   const risk = riskFor(r), b = remaining(r.person, requests);
   const reviewDays = requestDuration(r), burn = balanceDuration(r);
   const head = activePeople().length;
-  return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">MANAGER DECISION</div><h2 id="dialog-title">Review time off</h2><div class="reviewperson">${avatar(person(r.person))}<div><b>${escapeHtml(person(r.person)?.name || '')}</b><span>${typeLabel(r)} · ${range(r)} · ${daysLabel(reviewDays)}</span></div>${badge(r.status)}</div><div class="reviewfacts"><div><span>Balance after approval</span><b>${b.available - burn} days</b></div><div><span>Coverage impact</span><b class="${risk.length ? 'dangertext' : ''}">${risk.length ? `${daysLabel(risk.length)} below minimum` : 'No conflict'}</b></div></div>${risk.length ? `<div class="warnbox"><b>⚠ Coverage conflict</b><p>Approving this request leaves ${risk[0].available} of ${head} people available on ${risk.map(x => pretty(x.date)).join(', ')}. Your minimum is ${minimumCoverage}.</p></div>` : '<div class="okbox">✓ Team coverage meets the minimum for these dates.</div>'}${r.note ? `<div class="requestnote"><span>EMPLOYEE NOTE</span><p>${escapeHtml(r.note)}</p></div>` : ''}<form id="decisionform"><label>Decision note <span class="optional">Required to decline</span><textarea name="decisionNote" maxlength="500" placeholder="Add context for the employee"></textarea></label>${risk.length ? `<label class="checkline"><input type="checkbox" name="override" id="overrideCoverage"> I’ve arranged coverage and want to approve anyway.</label>` : ''}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" name="decision" value="declined" class="declinebutton">Decline</button><button type="submit" name="decision" value="approved" class="primary" ${risk.length ? 'disabled' : ''} id="approveBtn">Approve →</button></div></form></div></div>`;
+  return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">MANAGER DECISION</div><h2 id="dialog-title">Review time off</h2><div class="reviewperson">${avatar(person(r.person))}<div><b>${escapeHtml(person(r.person)?.name || '')}</b><span>${typeLabel(r)} · ${range(r)} · ${daysLabel(reviewDays)}</span></div>${badge(r.status)}</div><div class="reviewfacts"><div><span>Balance after approval</span><b>${b.available - burn} days</b></div><div><span>Coverage impact</span><b class="${risk.length ? 'dangertext' : ''}">${risk.length ? `${daysLabel(risk.length)} below minimum` : 'No conflict'}</b></div></div>${risk.length ? `<div class="warnbox"><b>⚠ Coverage conflict</b><p>Approving this request leaves ${risk[0].available} of ${head} people available on ${risk.map(x => pretty(x.date)).join(', ')}. Your minimum is ${minimumCoverage}.</p></div>` : '<div class="okbox">✓ Team coverage meets the minimum for these dates.</div>'}${r.note ? `<div class="requestnote"><span>EMPLOYEE NOTE</span><p>${escapeHtml(r.note)}</p></div>` : ''}<form id="decisionform"><label>Decision note <span class="optional">${risk.length ? 'Required when overriding coverage' : 'Required to decline'}</span><textarea name="decisionNote" maxlength="500" placeholder="${risk.length ? 'Briefly note how coverage is arranged' : 'Add context for the employee'}"></textarea></label>${risk.length ? `<label class="checkline"><input type="checkbox" name="override" id="overrideCoverage"> I’ve arranged coverage and want to approve anyway.</label>` : ''}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" name="decision" value="declined" class="declinebutton">Decline</button><button type="submit" name="decision" value="approved" class="primary" ${risk.length ? 'disabled' : ''} id="approveBtn">Approve →</button></div></form></div></div>`;
 }
 
 function renderRecovery() {
@@ -439,6 +541,10 @@ function renderRecovery() {
 
 function render() {
   if (loading) { app.innerHTML = '<main class="main"><h1>Loading team leave…</h1></main>'; return; }
+  if (passwordSavedOk && session) {
+    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PASSWORD SAVED</div><h1>You're ready</h1><p>Your new password is saved. Continue to the workspace, or sign out if this is not your device.</p>${loadError ? `<div class="warnbox" role="status"><b>Note</b><p>${escapeHtml(loadError)}</p></div>` : ''}<button class="primary" data-action="enterworkspace">Continue to workspace</button><button class="loginlink" data-action="signout">Sign out</button></section></main>`;
+    return;
+  }
   // Never show Sign in / Create password while a recovery link (or intent) is active.
   if (passwordRecovery || hasRecoveryIntent()) {
     passwordRecovery = true;
@@ -447,7 +553,8 @@ function render() {
   }
   if (!session) {
     const creating = authMode === 'signup', forgot = authMode === 'forgot';
-    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>${forgot ? 'Enter your work email. If you already created a password, we send a reset link. If you were invited and never set one, use Create password instead.' : creating ? 'Create a password for your invited work email.' : 'Sign in with your work email and password.'}</p>${forgot ? '' : `<div class="authtabs" role="tablist" aria-label="Account access"><button type="button" role="tab" aria-selected="${!creating}" class="${!creating ? 'active' : ''}" data-auth-mode="signin">Sign in</button><button type="button" role="tab" aria-selected="${creating}" class="${creating ? 'active' : ''}" data-auth-mode="signup">Create password</button></div>`}<form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com"></label>${forgot ? '' : `<label>Password<input name="password" type="password" autocomplete="${creating ? 'new-password' : 'current-password'}" minlength="8" required placeholder="At least 8 characters"></label>${creating ? '<label>Confirm password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="Repeat your password"></label>' : ''}`}<div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">${forgot ? 'Send reset link' : creating ? 'Create password' : 'Sign in'}</button></form>${forgot ? '<button class="loginlink" data-auth-mode="signup">Never created a password? Create password</button><button class="loginlink" data-auth-mode="signin">← Back to sign in</button>' : '<button class="loginlink" data-auth-mode="forgot">Forgot password?</button>'}<p class="loginhelp">Access is limited to email addresses already added by the team. Deactivated accounts cannot sign in. Notifications are in-app only.</p></section></main>`;
+    const prefill = readInviteEmail();
+    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>${forgot ? 'Enter your work email. If you already created a password, we send a reset link. If you were invited and never set one, use Create password instead.' : creating ? 'Create a password for your invited work email.' : 'Sign in with your work email and password.'}</p>${forgot ? '' : `<div class="authtabs" role="tablist" aria-label="Account access"><button type="button" role="tab" aria-selected="${!creating}" class="${!creating ? 'active' : ''}" data-auth-mode="signin">Sign in</button><button type="button" role="tab" aria-selected="${creating}" class="${creating ? 'active' : ''}" data-auth-mode="signup">Create password</button></div>`}<form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com" value="${escapeHtml(prefill)}"></label>${forgot ? '' : `<label>Password<input name="password" type="password" autocomplete="${creating ? 'new-password' : 'current-password'}" minlength="8" required placeholder="At least 8 characters"></label>${creating ? '<label>Confirm password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="Repeat your password"></label>' : ''}`}<div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">${forgot ? 'Send reset link' : creating ? 'Create password' : 'Sign in'}</button></form>${forgot ? '<button class="loginlink" data-auth-mode="signup">Never created a password? Create password</button><button class="loginlink" data-auth-mode="signin">← Back to sign in</button>' : '<button class="loginlink" data-auth-mode="forgot">Forgot password?</button>'}<p class="loginhelp">Access is limited to email addresses already added by an admin. Deactivated accounts cannot sign in — ask an <b>admin</b> to reactivate. Notifications are in-app only.</p></section></main>`;
     return;
   }
   if (loadError) { app.innerHTML = `<main class="loginpage"><section class="logincard"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" data-action="signout">Return to sign in</button></section></main>`; return; }
@@ -455,13 +562,19 @@ function render() {
   app.innerHTML = shell(page);
   if (modal?.kind === 'new' || modal?.kind === 'editrequest') updatePreview();
   if (modal) afterModalMount();
+  if (highlightRequestId) {
+    const row = document.querySelector(`[data-request-row="${highlightRequestId}"]`);
+    if (row) row.scrollIntoView({block: 'nearest', behavior: 'smooth'});
+    setTimeout(() => { highlightRequestId = null; }, 4000);
+  }
 }
 
 function updatePreview() {
   const form = document.getElementById('requestform'), box = document.getElementById('requestpreview'); if (!form || !box) return;
   const personId = form.elements.person.value, start = form.elements.start.value, end = form.elements.end.value, portion = Number(form.elements.portion.value), type = form.elements.type.value;
   const days = businessDays(start, end) * portion, balance = remaining(personId, requests), burnsBalance = type === 'Vacation', isRemote = type === 'Work From Home', risk = coverageFor(start, end, requests, isRemote ? null : personId, modal?.id).filter(d => d.conflict);
-  box.innerHTML = `<div class="previewline"><span>Weekdays requested</span><b>${daysLabel(days)}</b></div><div class="previewline"><span>Balance after approval</span><b>${burnsBalance ? balance.available - days : balance.available} days</b></div><div class="previewline"><span>Team coverage</span><b class="${risk.length ? 'dangertext' : ''}">${isRemote ? '✓ Working remotely' : risk.length ? `⚠ ${daysLabel(risk.length)} below minimum` : '✓ No conflict found'}</b></div>`;
+  const pendingOther = requests.filter(r => r.id !== modal?.id && r.person === personId && r.status === 'pending' && +r.start.slice(0, 4) === new Date().getFullYear()).reduce((n, r) => n + balanceDuration(r), 0);
+  box.innerHTML = `<div class="previewline"><span>Weekdays requested</span><b>${daysLabel(days)}</b></div><div class="previewline"><span>Already pending</span><b>${daysLabel(pendingOther)}</b></div><div class="previewline"><span>Balance after approval</span><b>${burnsBalance ? balance.available - days : balance.available} days</b></div><div class="previewline"><span>Team coverage</span><b class="${risk.length ? 'dangertext' : ''}">${isRemote ? '✓ Working remotely' : risk.length ? `⚠ ${daysLabel(risk.length)} below minimum` : '✓ No conflict found'}</b></div>`;
 }
 function toast(message) { const el = document.getElementById('toast'); if (!el) return; el.textContent = message; el.classList.add('visible'); setTimeout(() => el.classList.remove('visible'), 3500); }
 function setError(message) { const el = document.getElementById('formerror'); if (el) el.textContent = message; }
@@ -485,6 +598,42 @@ app.addEventListener('click', async e => {
     return;
   }
   const copy = e.target.closest('[data-copy-invite]'); if (copy) { await navigator.clipboard.writeText(decodeURIComponent(copy.dataset.copyInvite)); toast('Access details copied.'); return; }
+  const openNotice = e.target.closest('[data-open-notice]');
+  if (openNotice) {
+    const requestId = openNotice.dataset.request;
+    const n = notifications.find(x => x.id === openNotice.dataset.openNotice);
+    if (n) n.read = true;
+    await supabase.rpc('mark_notifications_read').catch(() => {});
+    if (requestId) {
+      const r = requests.find(x => x.id === requestId);
+      if (r) {
+        highlightRequestId = r.id;
+        view = 'requests';
+        if (isManagerRole() && r.person !== me && r.status === 'pending' && managesPerson(mePerson(), person(r.person))) {
+          openModal({kind:'review', id:r.id});
+        } else if (r.person === me && r.status === 'pending') {
+          openModal({kind:'editrequest', id:r.id});
+        } else {
+          modal = null;
+          requestFilter = r.status === 'pending' ? 'pending' : 'all';
+          render();
+        }
+        return;
+      }
+    }
+    modal = null;
+    view = 'requests';
+    render();
+    return;
+  }
+  const resend = e.target.closest('[data-resendinvite]');
+  if (resend && isAdmin()) {
+    const p = person(resend.dataset.resendinvite);
+    if (p?.email) openModal({kind:'invite', email:p.email});
+    return;
+  }
+  const userFilterBtn = e.target.closest('[data-userfilter]');
+  if (userFilterBtn) { userListFilter = userFilterBtn.dataset.userfilter; render(); return; }
   const nav = e.target.closest('[data-view]'); if (nav) { if (nav.dataset.view === 'users' && !isAdmin()) { toast('Only admins can manage users.'); return; } view = nav.dataset.view; modal = null; render(); return; }
   const filter = e.target.closest('[data-filter]'); if (filter) { requestFilter = filter.dataset.filter; render(); return; }
 
@@ -508,9 +657,17 @@ app.addEventListener('click', async e => {
   const date = e.target.closest('[data-date]'); if (date) { selectedDay = date.dataset.date; month = new Date(parseDate(selectedDay).getFullYear(), parseDate(selectedDay).getMonth(), 1); render(); return; }
   const button = e.target.closest('[data-action]'); if (!button) return;
   if (button.dataset.action === 'close') { if (e.target === button || button.tagName === 'BUTTON') closeModal(); return; }
+  if (button.dataset.action === 'enterworkspace') {
+    passwordSavedOk = false;
+    if (!loadError) startLive();
+    render();
+    return;
+  }
+  if (button.dataset.action === 'help') { openModal({kind:'help'}); return; }
   if (button.dataset.action === 'signout') {
     passwordRecovery = false;
     recoveryError = '';
+    passwordSavedOk = false;
     clearRecoveryIntent();
     stopLive();
     await supabase.auth.signOut();
@@ -559,7 +716,12 @@ app.addEventListener('click', async e => {
     return;
   }
   if (button.dataset.action === 'rollover' && isManagerRole()) {
-    if (!confirm('Reset carry-in (profiles.used) to 0 for your team? Carry-over policy is 0 — unused vacation does not roll forward. Approved leave history is kept.')) return;
+    const pendingVacation = teamRequests().filter(r => r.status === 'pending' && r.type === 'Vacation');
+    if (pendingVacation.length) {
+      if (!confirm(`There ${pendingVacation.length === 1 ? 'is still 1 pending Vacation request' : `are still ${pendingVacation.length} pending Vacation requests`}. Decide them first if possible. Reset carry-in anyway?`)) return;
+    } else if (!confirm('Reset carry-in (profiles.used) to 0 for your team? Carry-over policy is 0 — unused vacation does not roll forward. Approved leave history is kept.')) {
+      return;
+    }
     try { await save('/api/rollover', {}); render(); toast('Carry-in reset for your team.'); } catch (err) { toast(err.message); }
     return;
   }
@@ -600,7 +762,24 @@ app.addEventListener('click', async e => {
   if (button.dataset.action === 'today') { month = new Date(new Date().getFullYear(), new Date().getMonth(), 1); selectedDay = iso(new Date()); render(); }
 });
 
-app.addEventListener('input', e => { if (e.target.closest('#requestform')) { updatePreview(); setError(''); } });
+app.addEventListener('input', e => {
+  if (e.target.closest('#requestform')) { updatePreview(); setError(''); }
+  if (e.target.id === 'usersearch') {
+    userSearch = e.target.value;
+    // Re-render list without losing focus: update only userlist when possible
+    const panel = e.target.closest('.userspanel');
+    if (!panel) { render(); return; }
+    // Debounced light re-render of users page
+    clearTimeout(app._userSearchTimer);
+    app._userSearchTimer = setTimeout(() => {
+      const active = document.activeElement === e.target;
+      const pos = e.target.selectionStart;
+      render();
+      const input = document.getElementById('usersearch');
+      if (active && input) { input.focus(); input.setSelectionRange(pos, pos); }
+    }, 120);
+  }
+});
 app.addEventListener('change', e => {
   const f = e.target.closest('#requestform');
   if (f) { if (e.target.name === 'portion' && e.target.value === '0.5') f.elements.end.value = f.elements.start.value; updatePreview(); }
@@ -628,7 +807,7 @@ app.addEventListener('submit', async e => {
       if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; }
       const {data:invited, error:inviteError} = await supabase.rpc('is_invited_email', {p_email:email});
       if (inviteError) { setError(formatRpcError(inviteError.message)); return; }
-      if (!invited) { setError('This email is not on the team yet. Ask a manager to add you first.'); return; }
+      if (!invited) { setError('This email is not on the team yet. Ask an admin to add you first.'); return; }
     }
     const result = authMode === 'signup' ? await supabase.auth.signUp({email, password}) : await supabase.auth.signInWithPassword({email, password});
     if (result.error) { setError(result.error.message); return; }
@@ -649,21 +828,36 @@ app.addEventListener('submit', async e => {
     clearRecoveryIntent();
     scrubAuthParamsFromUrl();
     loadError = '';
-    try { await loadState(); startLive(); }
+    try { await loadState(); }
     catch (err) { loadError = err.message; }
+    passwordSavedOk = true;
     render();
-    if (!loadError) toast('Password updated. You are signed in.');
     return;
   }
   if (e.target.id === 'passwordform') { e.preventDefault(); const f = e.target, password = f.elements.password.value; if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; } const {error} = await supabase.auth.updateUser({password}); if (error) setError(error.message); else { closeModal(); toast('Password updated.'); } return; }
   if (e.target.id === 'edituserform') {
     e.preventDefault(); const f = e.target;
+    const makingInactive = !f.elements.active.checked;
+    const nextRole = f.elements.role.value;
+    const target = person(modal.id);
+    if (makingInactive || nextRole !== 'admin') {
+      const otherAdmins = people.filter(p => p.id !== modal.id && p.role === 'admin' && p.active !== false);
+      if (target?.role === 'admin' && target.active !== false && !otherAdmins.length) {
+        setError('You cannot remove or deactivate the last active admin.');
+        return;
+      }
+    }
+    if (makingInactive && modal.id === me) {
+      if (!confirm('Deactivate your own account? You will lose access until another admin reactivates you.')) return;
+    } else if (makingInactive && target?.role === 'admin') {
+      if (!confirm(`Deactivate admin ${target.name}? They will lose access until reactivated.`)) return;
+    }
     try {
       await save('/api/people/' + encodeURIComponent(modal.id), {
         name: f.elements.name.value,
         allowance: Number(f.elements.allowance.value),
         used: Number(f.elements.used.value),
-        role: f.elements.role.value,
+        role: nextRole,
         team: f.elements.team.value,
         managerEmail: f.elements.managerEmail.value.trim(),
         active: f.elements.active.checked
@@ -685,7 +879,16 @@ app.addEventListener('submit', async e => {
     e.preventDefault(); const f = e.target, personId = f.elements.person.value, start = f.elements.start.value, end = f.elements.end.value, portion = Number(f.elements.portion.value), type = f.elements.type.value, editing = modal.kind === 'editrequest';
     const error = portion === 0.5 && start !== end ? 'Half-day requests must start and end on the same date.' : validateRequest({person:personId, start, end, type, portion, excludeId:editing ? modal.id : null}, requests);
     if (error) { setError(error); return; }
-    try { await save(editing ? '/api/requests/' + encodeURIComponent(modal.id) : '/api/requests', {person:personId, start, end, note:f.elements.note.value.trim(), type, portion}); modal = null; view = 'requests'; render(); toast(editing ? 'Request updated.' : 'Request submitted for manager review.'); } catch (err) { setError(err.message); }
+    try {
+      const editId = editing ? modal.id : null;
+      await save(editing ? '/api/requests/' + encodeURIComponent(modal.id) : '/api/requests', {person:personId, start, end, note:f.elements.note.value.trim(), type, portion});
+      // Highlight the submitted/updated request (match by dates+person if new).
+      const match = editId
+        ? requests.find(r => r.id === editId)
+        : requests.find(r => r.person === personId && r.start === start && r.end === end && r.status === 'pending');
+      highlightRequestId = match?.id || null;
+      modal = null; view = 'requests'; render(); toast(editing ? 'Request updated.' : 'Request submitted for manager review.');
+    } catch (err) { setError(err.message); }
     return;
   }
   if (e.target.id === 'decisionform') {
@@ -694,6 +897,7 @@ app.addEventListener('submit', async e => {
     if (!managesPerson(mePerson(), person(r.person))) { setError('You can only decide requests for your team.'); return; }
     if (decision === 'declined' && !note) { setError('Add a short reason before declining.'); return; }
     if (decision === 'approved' && riskFor(r).length && !f.elements.override?.checked) { setError('Confirm that coverage is arranged before approving this conflict.'); return; }
+    if (decision === 'approved' && riskFor(r).length && f.elements.override?.checked && !note) { setError('Add one sentence explaining how coverage is arranged.'); return; }
     if (decision === 'approved') {
       const bal = remaining(r.person, requests);
       const pendingOther = requests.filter(x => x.id !== r.id && x.person === r.person && x.status === 'pending' && +x.start.slice(0, 4) === new Date().getFullYear()).reduce((n, x) => n + balanceDuration(x), 0);

@@ -54,11 +54,13 @@ create table if not exists public.notifications (
   read boolean not null default false,
   created_at timestamptz not null default now()
 );
+alter table public.notifications add column if not exists request_id uuid references public.leave_requests(id) on delete set null;
 create table if not exists public.team_settings (
   id integer primary key default 1 check (id = 1),
   minimum_coverage integer check (minimum_coverage is null or minimum_coverage >= 1),
   updated_at timestamptz not null default now()
 );
+alter table public.team_settings add column if not exists last_rollover_at timestamptz;
 insert into public.team_settings(id, minimum_coverage) values (1, null)
 on conflict (id) do nothing;
 
@@ -313,6 +315,9 @@ begin
   where p.active and manages_person(p.id);
   get diagnostics v_count = row_count;
   update profiles set used = 0 where id = current_profile_id();
+  insert into team_settings(id, minimum_coverage, last_rollover_at, updated_at)
+  values (1, null, now(), now())
+  on conflict (id) do update set last_rollover_at = now(), updated_at = now();
   return v_count;
 end $$;
 
@@ -369,8 +374,8 @@ begin
   values(p_person,p_start,p_end,p_type,p_portion,'pending',left(coalesce(p_note,''),500),now())
   returning id into v_id;
 
-  insert into notifications(recipient_email,title,message)
-  select email, 'New request', v_person.name||' submitted a '||p_type||' request ('||v_days||' day(s)).'
+  insert into notifications(recipient_email,title,message,request_id)
+  select email, 'New request', v_person.name||' submitted a '||p_type||' request ('||v_days||' day(s)).', v_id
   from profiles
   where role = 'manager' and active
     and (team = v_person.team or lower(email) = lower(coalesce(v_person.manager_email,'')));
@@ -482,11 +487,12 @@ begin
   where id = p_request;
 
   select * into v_person from profiles where id = v_row.person;
-  insert into notifications(recipient_email,title,message)
+  insert into notifications(recipient_email,title,message,request_id)
   values(
     v_person.email,
     'Request '||p_decision,
-    'Your '||v_row.type||' request for '||v_row.start||' to '||v_row."end"||' was '||p_decision||'.'
+    'Your '||v_row.type||' request for '||v_row.start||' to '||v_row."end"||' was '||p_decision||'.',
+    v_row.id
   );
 end $$;
 
@@ -504,6 +510,22 @@ language sql security definer set search_path=public as $$
   update notifications set read = true
   where lower(recipient_email) = lower(coalesce(auth.jwt()->>'email',''))
 $$;
+
+create or replace function public.list_profile_auth_status()
+returns jsonb
+language plpgsql security definer set search_path=public as $$
+begin
+  if not is_admin() then raise exception 'Admin access required.'; end if;
+  return coalesce((
+    select jsonb_agg(jsonb_build_object(
+      'id', p.id,
+      'has_auth', exists (
+        select 1 from auth.users u where lower(u.email) = lower(p.email)
+      )
+    ) order by p.name)
+    from public.profiles p
+  ), '[]'::jsonb);
+end $$;
 
 drop function if exists public.upsert_holiday(date,text);
 create or replace function public.upsert_holiday(p_date date, p_name text, p_region text default 'Ontario') returns void
@@ -533,6 +555,7 @@ revoke all on function public.update_leave(uuid,date,date,text,text,numeric) fro
 revoke all on function public.decide_leave(uuid,text,text,boolean) from public,anon;
 revoke all on function public.cancel_leave(uuid) from public,anon;
 revoke all on function public.mark_notifications_read() from public,anon;
+revoke all on function public.list_profile_auth_status() from public,anon;
 revoke all on function public.upsert_holiday(date,text,text) from public,anon;
 revoke all on function public.delete_holiday(date) from public,anon;
 
@@ -546,6 +569,7 @@ grant execute on function public.update_leave(uuid,date,date,text,text,numeric) 
 grant execute on function public.decide_leave(uuid,text,text,boolean) to authenticated;
 grant execute on function public.cancel_leave(uuid) to authenticated;
 grant execute on function public.mark_notifications_read() to authenticated;
+grant execute on function public.list_profile_auth_status() to authenticated;
 grant execute on function public.upsert_holiday(date,text,text) to authenticated;
 grant execute on function public.delete_holiday(date) to authenticated;
 
