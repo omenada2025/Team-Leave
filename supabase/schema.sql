@@ -1,3 +1,7 @@
+-- Team Leave — current schema (greenfield).
+-- Run this entire file once in the Supabase SQL editor for a new project,
+-- then run seed_ontario_holidays.sql (or use Load Ontario holidays in the app).
+
 create extension if not exists pgcrypto;
 
 create table if not exists public.profiles (
@@ -5,96 +9,542 @@ create table if not exists public.profiles (
   email text not null unique,
   name text not null,
   allowance integer not null default 25 check (allowance between 0 and 100),
+  -- Carry-in / manual adjustment only. Do not store sum of approved leave here.
+  -- Year-end policy: carry-over = 0 (reset used to 0 via rollover_leave_year).
   used integer not null default 0 check (used between 0 and allowance),
-  role text not null default 'employee' check (role in ('employee','manager'))
+  role text not null default 'employee' check (role in ('employee','manager')),
+  team text not null default 'General',
+  manager_email text,
+  active boolean not null default true
 );
 
 create table if not exists public.leave_requests (
   id uuid primary key default gen_random_uuid(),
-  person uuid not null references public.profiles(id) on delete cascade,
+  person uuid not null references public.profiles(id), -- no cascade: keep history if profile soft-deactivated
   start date not null,
   "end" date not null,
-  type text not null default 'Vacation',
+  type text not null default 'Vacation' check (type in ('Vacation','Sick','Personal','Unpaid','Work From Home')),
+  portion numeric(3,1) not null default 1 check (portion in (0.5,1)),
   status text not null default 'pending' check (status in ('pending','approved','declined','cancelled')),
   note text not null default '',
   decision_note text not null default '',
-  submitted date not null default current_date,
-  decided date,
-  check ("end" >= start)
+  submitted timestamptz not null default now(),
+  decided timestamptz,
+  decided_by uuid references public.profiles(id),
+  check ("end" >= start),
+  check (portion <> 0.5 or start = "end")
 );
 
 create index if not exists leave_requests_person_start_idx on public.leave_requests(person,start);
 create index if not exists leave_requests_status_start_idx on public.leave_requests(status,start);
 
+create table if not exists public.holidays (
+  date date primary key,
+  name text not null,
+  region text not null default 'North America'
+);
+
+create table if not exists public.notifications (
+  id uuid primary key default gen_random_uuid(),
+  recipient_email text not null,
+  title text not null,
+  message text not null,
+  read boolean not null default false,
+  created_at timestamptz not null default now()
+);
+
+-- Singleton settings. minimum_coverage null → formula greatest(1, active_headcount - 2).
+create table if not exists public.team_settings (
+  id integer primary key default 1 check (id = 1),
+  minimum_coverage integer check (minimum_coverage is null or minimum_coverage >= 1),
+  updated_at timestamptz not null default now()
+);
+insert into public.team_settings(id, minimum_coverage) values (1, null)
+on conflict (id) do nothing;
+
+-- In-app notifications only. email_events (if present from older installs) is unused — drop it.
+drop table if exists public.email_events;
+
 alter table public.profiles enable row level security;
 alter table public.leave_requests enable row level security;
+alter table public.holidays enable row level security;
+alter table public.notifications enable row level security;
+alter table public.team_settings enable row level security;
 
-create or replace function public.current_profile_id() returns uuid language sql stable security definer set search_path=public as $$
-  select id from profiles where lower(email)=lower(coalesce(auth.jwt()->>'email','')) limit 1
+create or replace function public.current_profile_id() returns uuid
+language sql stable security definer set search_path=public as $$
+  select id from profiles where lower(email)=lower(coalesce(auth.jwt()->>'email','')) and active limit 1
 $$;
-create or replace function public.is_manager() returns boolean language sql stable security definer set search_path=public as $$
-  select exists(select 1 from profiles where id=current_profile_id() and role='manager')
+
+create or replace function public.is_manager() returns boolean
+language sql stable security definer set search_path=public as $$
+  select exists(select 1 from profiles where id=current_profile_id() and role='manager' and active)
 $$;
+
+-- True when the current manager owns this employee via team match or manager_email.
+create or replace function public.manages_person(p_person uuid) returns boolean
+language sql stable security definer set search_path=public as $$
+  select exists(
+    select 1
+    from profiles me
+    join profiles them on them.id = p_person
+    where me.id = current_profile_id()
+      and me.role = 'manager'
+      and me.active
+      and (
+        them.team = me.team
+        or lower(coalesce(them.manager_email, '')) = lower(me.email)
+      )
+  )
+$$;
+
+-- Allows the login "Create password" tab to confirm the email was added by a manager
+-- before calling Auth signup. Returns boolean only (no profile data). Inactive = not invited.
+create or replace function public.is_invited_email(p_email text) returns boolean
+language sql stable security definer set search_path=public as $$
+  select exists(select 1 from profiles where lower(email)=lower(trim(p_email)) and active)
+$$;
+
+create or replace function public.leave_duration(p_start date, p_end date, p_portion numeric)
+returns numeric language sql stable set search_path=public as $$
+  select coalesce(
+    (select count(*)::numeric * p_portion
+     from generate_series(p_start, p_end, '1 day') as g(day)
+     where extract(isodow from day) < 6
+       and not exists (select 1 from holidays h where h.date = day::date)),
+    0
+  )
+$$;
+
+create or replace function public.balance_duration(p_type text, p_start date, p_end date, p_portion numeric)
+returns numeric language sql stable set search_path=public as $$
+  select case when p_type = 'Vacation' then public.leave_duration(p_start, p_end, p_portion) else 0 end
+$$;
+
+create or replace function public.vacation_available(
+  p_person uuid,
+  p_year integer,
+  p_include_pending boolean default true,
+  p_exclude uuid default null
+) returns numeric language sql stable set search_path=public as $$
+  select greatest(0,
+    coalesce((select p.allowance - p.used from profiles p where p.id = p_person), 0)
+    - coalesce((
+        select sum(public.balance_duration(r.type, r.start, r."end", r.portion))
+        from leave_requests r
+        where r.person = p_person
+          and extract(year from r.start) = p_year
+          and (p_exclude is null or r.id <> p_exclude)
+          and (
+            r.status = 'approved'
+            or (p_include_pending and r.status = 'pending')
+          )
+      ), 0)
+  )
+$$;
+
+create or replace function public.active_headcount() returns integer
+language sql stable set search_path=public as $$
+  select count(*)::integer from profiles where active
+$$;
+
+create or replace function public.coverage_minimum() returns integer
+language sql stable set search_path=public as $$
+  select coalesce(
+    (select minimum_coverage from team_settings where id = 1),
+    greatest(1, public.active_headcount() - 2)
+  )
+$$;
+
+create or replace function public.has_coverage_conflict(p_person uuid, p_start date, p_end date, p_exclude uuid default null)
+returns boolean language plpgsql stable set search_path=public as $$
+declare
+  v_n integer;
+  v_min integer;
+  v_day date;
+  v_away integer;
+begin
+  v_n := public.active_headcount();
+  v_min := public.coverage_minimum();
+  for v_day in
+    select g.day::date from generate_series(p_start, p_end, '1 day') as g(day)
+    where extract(isodow from g.day) < 6
+      and not exists (select 1 from holidays h where h.date = g.day::date)
+  loop
+    select count(distinct r.person)::integer into v_away
+    from leave_requests r
+    join profiles p on p.id = r.person and p.active
+    where r.status = 'approved'
+      and r.type <> 'Work From Home'
+      and (p_exclude is null or r.id <> p_exclude)
+      and r.start <= v_day and r."end" >= v_day;
+    if not exists (
+      select 1 from leave_requests r
+      where r.status = 'approved'
+        and r.type <> 'Work From Home'
+        and r.person = p_person
+        and (p_exclude is null or r.id <> p_exclude)
+        and r.start <= v_day and r."end" >= v_day
+    ) then
+      v_away := v_away + 1;
+    end if;
+    if (v_n - v_away) < v_min then
+      return true;
+    end if;
+  end loop;
+  return false;
+end $$;
 
 drop policy if exists profiles_team_read on public.profiles;
-create policy profiles_team_read on public.profiles for select to authenticated using (current_profile_id() is not null);
+create policy profiles_team_read on public.profiles
+  for select to authenticated using (current_profile_id() is not null);
+
 drop policy if exists leave_team_read on public.leave_requests;
-create policy leave_team_read on public.leave_requests for select to authenticated using (current_profile_id() is not null and (is_manager() or person=current_profile_id() or status='approved'));
+create policy leave_team_read on public.leave_requests
+  for select to authenticated
+  using (
+    current_profile_id() is not null and (
+      person = current_profile_id()
+      or status = 'approved'
+      or (is_manager() and manages_person(person))
+    )
+  );
 
-create or replace function public.submit_leave(p_person uuid,p_start date,p_end date,p_note text default '') returns uuid
-language plpgsql security definer set search_path=public as $$
-declare v_me uuid:=current_profile_id();v_target uuid;v_id uuid;v_days int;v_available int;
-begin
-  if v_me is null then raise exception 'Your email is not on this team.'; end if;
-  v_target:=case when is_manager() and p_person is not null then p_person else v_me end;
-  if p_start<current_date or p_end<p_start or extract(year from p_start)<>extract(year from p_end) then raise exception 'Choose valid dates in the current leave year.'; end if;
-  select count(*) into v_days from generate_series(p_start,p_end,'1 day') as g(day) where extract(isodow from day)<6;
-  if v_days<1 or v_days>100 then raise exception 'Select 1 to 100 weekdays.'; end if;
-  if exists(select 1 from leave_requests where person=v_target and status in ('pending','approved') and start<=p_end and "end">=p_start) then raise exception 'An active request overlaps these dates.'; end if;
-  select p.allowance-p.used-coalesce((select sum((select count(*) from generate_series(r.start,r."end",'1 day') as g(day) where extract(isodow from day)<6)) from leave_requests r where r.person=v_target and r.status='approved' and extract(year from r.start)=extract(year from p_start)),0) into v_available from profiles p where p.id=v_target;
-  if v_days>v_available then raise exception 'This request exceeds the available balance.'; end if;
-  insert into leave_requests(person,start,"end",note) values(v_target,p_start,p_end,left(coalesce(p_note,''),500)) returning id into v_id;return v_id;
-end $$;
+drop policy if exists holidays_read on public.holidays;
+create policy holidays_read on public.holidays for select to authenticated using (true);
 
-create or replace function public.cancel_leave(p_request uuid) returns void language plpgsql security definer set search_path=public as $$
-begin update leave_requests set status='cancelled',decided=current_date where id=p_request and person=current_profile_id() and status='pending';if not found then raise exception 'Only your pending request can be cancelled.';end if;end $$;
+drop policy if exists notifications_own_read on public.notifications;
+create policy notifications_own_read on public.notifications
+  for select to authenticated
+  using (lower(recipient_email)=lower(coalesce(auth.jwt()->>'email','')));
 
-create or replace function public.decide_leave(p_request uuid,p_decision text,p_note text default '',p_override boolean default false) returns void
-language plpgsql security definer set search_path=public as $$
-declare v leave_requests%rowtype;
-begin
-  if not is_manager() then raise exception 'Manager access required.';end if;
-  select * into v from leave_requests where id=p_request and status='pending' for update;if not found then raise exception 'Request not found or already decided.';end if;
-  if v.person=current_profile_id() then raise exception 'A manager cannot approve their own request.';end if;
-  if p_decision not in ('approved','declined') then raise exception 'Choose approve or decline.';end if;
-  if p_decision='declined' and trim(coalesce(p_note,''))='' then raise exception 'Add a reason before declining.';end if;
-  if p_decision='approved' and not p_override and exists(
-    select 1 from generate_series(v.start,v."end",'1 day') as g(day)
-    where extract(isodow from day)<6 and
-      (select count(distinct r.person) from leave_requests r where r.status='approved' and r.start<=day and r."end">=day) >= least(2,greatest(0,(select count(*) from profiles)-1))
-  ) then raise exception 'Confirm arranged coverage before approving this conflict.';end if;
-  update leave_requests set status=p_decision,decision_note=left(coalesce(p_note,''),500),decided=current_date where id=p_request;
-end $$;
+drop policy if exists notifications_own_update on public.notifications;
+create policy notifications_own_update on public.notifications
+  for update to authenticated
+  using (lower(recipient_email)=lower(coalesce(auth.jwt()->>'email','')))
+  with check (lower(recipient_email)=lower(coalesce(auth.jwt()->>'email','')));
 
-create or replace function public.upsert_profile(p_email text default null,p_name text default null,p_allowance integer default 25,p_used integer default 0,p_role text default 'employee',p_id uuid default null) returns uuid
-language plpgsql security definer set search_path=public as $$
+drop policy if exists team_settings_read on public.team_settings;
+create policy team_settings_read on public.team_settings
+  for select to authenticated using (current_profile_id() is not null);
+
+create or replace function public.upsert_profile(
+  p_email text default null,
+  p_name text default null,
+  p_allowance integer default 25,
+  p_used integer default 0,
+  p_role text default 'employee',
+  p_id uuid default null,
+  p_team text default 'General',
+  p_manager_email text default null,
+  p_active boolean default true
+) returns uuid language plpgsql security definer set search_path=public as $$
 declare v_id uuid;
 begin
-  if not is_manager() then raise exception 'Manager access required.';end if;
-  if p_id is null then insert into profiles(email,name,allowance,used,role) values(lower(trim(p_email)),trim(p_name),p_allowance,p_used,p_role) returning id into v_id;
-  else update profiles set name=trim(p_name),allowance=p_allowance,used=p_used,role=case when lower(email)='rdaniglad@gmail.com' then 'manager' else p_role end where id=p_id returning id into v_id;end if;
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if p_id is not null then
+    update profiles set
+      name = coalesce(p_name, name),
+      allowance = p_allowance,
+      used = p_used,
+      role = p_role,
+      team = coalesce(nullif(trim(p_team),''),'General'),
+      manager_email = nullif(lower(trim(p_manager_email)),''),
+      active = coalesce(p_active, active)
+    where id = p_id returning id into v_id;
+  else
+    insert into profiles(email,name,allowance,used,role,team,manager_email,active)
+    values(
+      lower(trim(p_email)),
+      trim(p_name),
+      p_allowance,
+      p_used,
+      p_role,
+      coalesce(nullif(trim(p_team),''),'General'),
+      nullif(lower(trim(p_manager_email)),''),
+      coalesce(p_active, true)
+    )
+    on conflict(email) do update set
+      name = excluded.name,
+      allowance = excluded.allowance,
+      team = excluded.team,
+      manager_email = excluded.manager_email,
+      active = true
+    returning id into v_id;
+  end if;
   return v_id;
 end $$;
 
-insert into public.profiles(email,name,allowance,used,role)
-values('rdaniglad@gmail.com','Daniela Omena',25,0,'manager')
-on conflict(email) do update set name=excluded.name,role='manager';
+create or replace function public.set_profile_active(p_id uuid, p_active boolean)
+returns void language plpgsql security definer set search_path=public as $$
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if p_id = current_profile_id() then raise exception 'You cannot deactivate your own account.'; end if;
+  update profiles set active = p_active where id = p_id;
+  if not found then raise exception 'User not found.'; end if;
+end $$;
 
-grant execute on function public.submit_leave(uuid,date,date,text) to authenticated;
-grant execute on function public.cancel_leave(uuid) to authenticated;
+create or replace function public.set_minimum_coverage(p_minimum integer)
+returns void language plpgsql security definer set search_path=public as $$
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if p_minimum is not null and p_minimum < 1 then raise exception 'Minimum coverage must be at least 1.'; end if;
+  insert into team_settings(id, minimum_coverage, updated_at)
+  values (1, p_minimum, now())
+  on conflict (id) do update set minimum_coverage = excluded.minimum_coverage, updated_at = now();
+end $$;
+
+-- Carry-over policy default = 0: resets profiles.used (carry-in) to 0 for the manager's team.
+create or replace function public.rollover_leave_year()
+returns integer language plpgsql security definer set search_path=public as $$
+declare v_count integer;
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  update profiles p
+  set used = 0
+  where p.active
+    and manages_person(p.id);
+  get diagnostics v_count = row_count;
+  -- Also reset the manager's own carry-in.
+  update profiles set used = 0 where id = current_profile_id();
+  return v_count;
+end $$;
+
+create or replace function public.submit_leave(
+  p_person uuid,
+  p_start date,
+  p_end date,
+  p_note text default '',
+  p_type text default 'Vacation',
+  p_portion numeric default 1
+) returns uuid language plpgsql security definer set search_path=public as $$
+declare
+  v_me uuid := current_profile_id();
+  v_id uuid;
+  v_days numeric;
+  v_burn numeric;
+  v_available numeric;
+  v_person profiles%rowtype;
+begin
+  if v_me is null then raise exception 'Your email is not on this team.'; end if;
+  if p_person <> v_me and not (is_manager() and manages_person(p_person)) then raise exception 'Not permitted.'; end if;
+  if p_start < current_date or p_end < p_start then raise exception 'Choose valid dates.'; end if;
+  if extract(year from p_start) <> extract(year from p_end)
+     or extract(year from p_start) <> extract(year from current_date) then
+    raise exception 'Keep this request within the current leave year.';
+  end if;
+  if p_type not in ('Vacation','Sick','Personal','Unpaid','Work From Home') then
+    raise exception 'Invalid request type.';
+  end if;
+  if p_portion not in (0.5,1) or (p_portion = 0.5 and p_start <> p_end) then
+    raise exception 'Invalid request duration.';
+  end if;
+  select * into v_person from profiles where id = p_person and active;
+  if not found then raise exception 'Employee not found.'; end if;
+
+  v_days := public.leave_duration(p_start, p_end, p_portion);
+  if v_days <= 0 then raise exception 'Choose at least one business day.'; end if;
+  if exists(
+    select 1 from leave_requests
+    where person = p_person and status in ('pending','approved')
+      and daterange(start,"end",'[]') && daterange(p_start,p_end,'[]')
+  ) then raise exception 'This request overlaps an existing request.'; end if;
+
+  v_burn := public.balance_duration(p_type, p_start, p_end, p_portion);
+  if v_burn > 0 then
+    v_available := public.vacation_available(p_person, extract(year from p_start)::integer, true, null);
+    if v_burn > v_available then
+      raise exception 'This request exceeds the available balance.';
+    end if;
+  end if;
+
+  insert into leave_requests(person,start,"end",type,portion,status,note,submitted)
+  values(p_person,p_start,p_end,p_type,p_portion,'pending',left(coalesce(p_note,''),500),now())
+  returning id into v_id;
+
+  -- In-app notifications only (no email sender).
+  insert into notifications(recipient_email,title,message)
+  select email, 'New request', v_person.name||' submitted a '||p_type||' request ('||v_days||' day(s)).'
+  from profiles
+  where role = 'manager' and active
+    and (team = v_person.team or lower(email) = lower(coalesce(v_person.manager_email,'')));
+
+  return v_id;
+end $$;
+
+create or replace function public.update_leave(
+  p_request uuid,
+  p_start date,
+  p_end date,
+  p_note text default '',
+  p_type text default 'Vacation',
+  p_portion numeric default 1
+) returns void language plpgsql security definer set search_path=public as $$
+declare
+  v_row leave_requests%rowtype;
+  v_days numeric;
+  v_burn numeric;
+  v_available numeric;
+begin
+  select * into v_row from leave_requests where id = p_request and status = 'pending' for update;
+  if not found then raise exception 'Pending request not found.'; end if;
+  if v_row.person <> current_profile_id()
+     and not (is_manager() and manages_person(v_row.person)) then
+    raise exception 'Pending request not found.';
+  end if;
+  if p_start < current_date or p_end < p_start then raise exception 'Choose valid dates.'; end if;
+  if extract(year from p_start) <> extract(year from p_end)
+     or extract(year from p_start) <> extract(year from current_date) then
+    raise exception 'Keep this request within the current leave year.';
+  end if;
+  if p_portion not in (0.5,1) or (p_portion = 0.5 and p_start <> p_end) then
+    raise exception 'Invalid dates or duration.';
+  end if;
+  if p_type not in ('Vacation','Sick','Personal','Unpaid','Work From Home') then
+    raise exception 'Invalid request type.';
+  end if;
+  v_days := public.leave_duration(p_start, p_end, p_portion);
+  if v_days <= 0 then raise exception 'Choose at least one business day.'; end if;
+  if exists(
+    select 1 from leave_requests
+    where person = v_row.person and id <> p_request and status in ('pending','approved')
+      and daterange(start,"end",'[]') && daterange(p_start,p_end,'[]')
+  ) then raise exception 'This request overlaps an existing request.'; end if;
+
+  v_burn := public.balance_duration(p_type, p_start, p_end, p_portion);
+  if v_burn > 0 then
+    v_available := public.vacation_available(v_row.person, extract(year from p_start)::integer, true, p_request);
+    if v_burn > v_available then
+      raise exception 'This request exceeds the available balance.';
+    end if;
+  end if;
+
+  update leave_requests
+  set start = p_start, "end" = p_end, note = left(coalesce(p_note,''),500),
+      type = p_type, portion = p_portion, submitted = now()
+  where id = p_request;
+end $$;
+
+create or replace function public.decide_leave(
+  p_request uuid,
+  p_decision text,
+  p_note text default '',
+  p_override boolean default false
+) returns void language plpgsql security definer set search_path=public as $$
+declare
+  v_row leave_requests%rowtype;
+  v_person profiles%rowtype;
+  v_burn numeric;
+  v_available numeric;
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if p_decision not in ('approved','declined') then raise exception 'Invalid decision.'; end if;
+  if p_decision = 'declined' and trim(coalesce(p_note,'')) = '' then
+    raise exception 'A decline reason is required.';
+  end if;
+
+  select * into v_row from leave_requests where id = p_request and status = 'pending' for update;
+  if not found then raise exception 'Pending request not found.'; end if;
+  if v_row.person = current_profile_id() then
+    raise exception 'A manager cannot decide their own request.';
+  end if;
+  if not manages_person(v_row.person) then
+    raise exception 'You can only decide requests for your team.';
+  end if;
+
+  if p_decision = 'approved' then
+    v_burn := public.balance_duration(v_row.type, v_row.start, v_row."end", v_row.portion);
+    if v_burn > 0 then
+      v_available := public.vacation_available(v_row.person, extract(year from v_row.start)::integer, true, v_row.id);
+      if v_burn > v_available then
+        raise exception 'The employee no longer has enough available days.';
+      end if;
+    end if;
+
+    if v_row.type <> 'Work From Home'
+       and not p_override
+       and public.has_coverage_conflict(v_row.person, v_row.start, v_row."end", v_row.id) then
+      raise exception 'Confirm arranged coverage before approving this conflict.';
+    end if;
+  end if;
+
+  update leave_requests
+  set status = p_decision,
+      decision_note = left(coalesce(p_note,''),500),
+      decided = now(),
+      decided_by = current_profile_id()
+  where id = p_request;
+
+  select * into v_person from profiles where id = v_row.person;
+  insert into notifications(recipient_email,title,message)
+  values(
+    v_person.email,
+    'Request '||p_decision,
+    'Your '||v_row.type||' request for '||v_row.start||' to '||v_row."end"||' was '||p_decision||'.'
+  );
+end $$;
+
+create or replace function public.cancel_leave(p_request uuid) returns void
+language plpgsql security definer set search_path=public as $$
+begin
+  update leave_requests
+  set status = 'cancelled', decided = now()
+  where id = p_request and person = current_profile_id() and status = 'pending';
+  if not found then raise exception 'Pending request not found.'; end if;
+end $$;
+
+create or replace function public.mark_notifications_read() returns void
+language sql security definer set search_path=public as $$
+  update notifications set read = true
+  where lower(recipient_email) = lower(coalesce(auth.jwt()->>'email',''))
+$$;
+
+create or replace function public.upsert_holiday(p_date date, p_name text, p_region text default 'Ontario') returns void
+language plpgsql security definer set search_path=public as $$
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  insert into holidays(date,name,region) values(p_date, trim(p_name), coalesce(nullif(trim(p_region),''),'Ontario'))
+  on conflict(date) do update set name = excluded.name, region = excluded.region;
+end $$;
+
+create or replace function public.delete_holiday(p_date date) returns void
+language plpgsql security definer set search_path=public as $$
+begin
+  if not is_manager() then raise exception 'Manager access required.'; end if;
+  delete from holidays where date = p_date;
+  if not found then raise exception 'Holiday not found.'; end if;
+end $$;
+
+revoke all on function public.is_invited_email(text) from public;
+revoke all on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) from public,anon;
+revoke all on function public.set_profile_active(uuid,boolean) from public,anon;
+revoke all on function public.set_minimum_coverage(integer) from public,anon;
+revoke all on function public.rollover_leave_year() from public,anon;
+revoke all on function public.submit_leave(uuid,date,date,text,text,numeric) from public,anon;
+revoke all on function public.update_leave(uuid,date,date,text,text,numeric) from public,anon;
+revoke all on function public.decide_leave(uuid,text,text,boolean) from public,anon;
+revoke all on function public.cancel_leave(uuid) from public,anon;
+revoke all on function public.mark_notifications_read() from public,anon;
+revoke all on function public.upsert_holiday(date,text,text) from public,anon;
+revoke all on function public.delete_holiday(date) from public,anon;
+
+grant execute on function public.is_invited_email(text) to anon, authenticated;
+grant execute on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) to authenticated;
+grant execute on function public.set_profile_active(uuid,boolean) to authenticated;
+grant execute on function public.set_minimum_coverage(integer) to authenticated;
+grant execute on function public.rollover_leave_year() to authenticated;
+grant execute on function public.submit_leave(uuid,date,date,text,text,numeric) to authenticated;
+grant execute on function public.update_leave(uuid,date,date,text,text,numeric) to authenticated;
 grant execute on function public.decide_leave(uuid,text,text,boolean) to authenticated;
-grant execute on function public.upsert_profile(text,text,integer,integer,text,uuid) to authenticated;
-revoke execute on function public.submit_leave(uuid,date,date,text) from public,anon;
-revoke execute on function public.cancel_leave(uuid) from public,anon;
-revoke execute on function public.decide_leave(uuid,text,text,boolean) from public,anon;
-revoke execute on function public.upsert_profile(text,text,integer,integer,text,uuid) from public,anon;
+grant execute on function public.cancel_leave(uuid) to authenticated;
+grant execute on function public.mark_notifications_read() to authenticated;
+grant execute on function public.upsert_holiday(date,text,text) to authenticated;
+grant execute on function public.delete_holiday(date) to authenticated;
+
+grant select on public.holidays to authenticated;
+grant select on public.team_settings to authenticated;
+grant select, update on public.notifications to authenticated;
+
+insert into public.profiles(email,name,allowance,used,role,team,active)
+values('rdaniglad@gmail.com','Daniela Omena',25,0,'manager','General',true)
+on conflict(email) do update set name = excluded.name, role = 'manager', active = true;

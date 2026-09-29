@@ -1,0 +1,23 @@
+name: CI
+on:
+  pull_request:
+  push:
+    branches: [main]
+jobs:
+  logic:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Build dist from src
+        run: bash scripts/build.sh
+      - name: Leave balance & coverage logic
+        run: node scripts/test-logic.mjs
+      - name: SQL source checks
+        run: node scripts/test-sql.mjs
+      - name: Dist mirrors src
+        run: |
+          diff -q src/logic.mjs dist/logic.mjs
+          diff -q src/app.mjs dist/app.mjs
