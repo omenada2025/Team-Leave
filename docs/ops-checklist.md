@@ -91,7 +91,7 @@ group by p.id order by p.email;
 - [ ] Auth URLs match section A
 - [ ] Email templates: Reset password subject starts with **Team Leave —** (see `docs/email-templates/`)
 - [ ] SQL: `must_change_password` column + RPCs applied
-- [ ] Users → Add user → mailto shows **temporary password**
+- [ ] Users → Add user → **Copy email / Open email** uses subject `Team Leave — Your temporary password`
 - [ ] Sign in with temp password → blocked until **Choose a new password**
 - [ ] Forgot / admin Reset → **Set a new password** (recovery, separate from force-change)
 - [ ] Deactivated user cannot sign in
@@ -102,4 +102,4 @@ group by p.id order by p.email;
 ## Optional
 
 - Enable **Realtime** for `leave_requests` and `notifications` (app also polls ~45s).
-- Confirm Users badges (“Never signed in” / “Has Auth”) after upgrade (`list_profile_auth_status`).
+- Confirm Users badges (“Never signed in” / “Has Auth”) — RPC `list_profile_auth_status` is live; badges appear for admins when the call succeeds.

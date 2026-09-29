@@ -17,6 +17,8 @@ jobs:
         run: node scripts/test-logic.mjs
       - name: Auth recovery URL helpers
         run: node scripts/test-auth-url.mjs
+      - name: Temp password mailto template
+        run: node scripts/test-invite-email.mjs
       - name: SQL source checks
         run: node scripts/test-sql.mjs
       - name: Dist mirrors src
@@ -24,3 +26,4 @@ jobs:
           diff -q src/logic.mjs dist/logic.mjs
           diff -q src/app.mjs dist/app.mjs
           diff -q src/auth-url.mjs dist/auth-url.mjs
+          diff -q src/invite-email.mjs dist/invite-email.mjs

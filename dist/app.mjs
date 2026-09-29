@@ -8,6 +8,9 @@ import {
   appRedirectUrl, parseAuthUrl, scrubAuthParamsFromUrl, markRecoveryIntent,
   clearRecoveryIntent, hasRecoveryIntent
 } from './auth-url.mjs';
+import {
+  ACCESS_EMAIL_SUBJECT, accessEmailCopyText, accessMailtoHref
+} from './invite-email.mjs';
 import {createClient} from 'https://esm.sh/@supabase/supabase-js@2';
 
 const SUPABASE_URL = 'https://skezxxnhsvdrwrdxabje.supabase.co';
@@ -64,14 +67,19 @@ const generateTempPassword = () => {
   for (const b of bytes) out += alphabet[b % alphabet.length];
   return `${out}Aa1!`;
 };
-const accessEmailBody = (email, password) =>
-  `You have been added to Team Leave.\n\n` +
-  `1. Open: ${inviteLink()}\n` +
-  `2. Sign in with:\n` +
-  `   Email: ${email}\n` +
-  `   Temporary password: ${password}\n` +
-  `3. You will be asked to choose a new password before using the app.\n\n` +
-  `Do not forward this email. If you did not expect access, tell your admin.`;
+
+/**
+ * supabase.rpc() returns a thenable PostgrestBuilder with .then only — not a Promise,
+ * so .catch is not a function. Await { error } instead (best-effort / ignore failures).
+ */
+const rpcSoft = async (fn, args) => {
+  try {
+    const {error} = args === undefined ? await supabase.rpc(fn) : await supabase.rpc(fn, args);
+    return error || null;
+  } catch (_) {
+    return null;
+  }
+};
 
 /**
  * Create or reset Auth user with a temp password.
@@ -541,13 +549,15 @@ function usersPage() {
     const awaiting = p.active !== false && (p.id in authStatusById) && !authStatusById[p.id];
     return `<div class="userrow ${p.active === false ? 'inactive' : ''}">${avatar(p)}<div class="useridentity"><b>${escapeHtml(p.name)}</b><span>${escapeHtml(p.email || '')} · ${escapeHtml(p.team || 'General')}${p.active === false ? ' · Deactivated' : ''}</span>${authBadge(p)}</div><span class="userrole">${roleLabel(p.role)}</span><span class="userbalance"><b>${remaining(p.id, requests).available}</b> days available</span><div class="useractions">${awaiting ? `<button class="rowaction" data-resendinvite="${p.id}">Resend invite</button>` : ''}<button class="rowaction" data-edituser="${p.id}" aria-label="Edit ${escapeHtml(p.name)}">Edit</button></div></div>`;
   }).join('') || '<div class="empty">No users match this filter.</div>'}</div></section>
-  <p class="userhint">Adding a user creates their team profile <b>and</b> an Auth account with a temporary password (role starts as Employee — promote later in Edit). Email them the temp password (Open email / Copy). They must set a new password on first sign-in. Deactivating keeps leave history and blocks sign-in. Auth status badges need the live SQL upgrade (<code>list_profile_auth_status</code>).</p>`;
+  <p class="userhint">Adding a user creates their team profile <b>and</b> an Auth account with a temporary password (role starts as Employee — promote later in Edit). Email them the temp password (Open email / Copy — uses the Team Leave welcome template). They must set a new password on first sign-in. Deactivating keeps leave history and blocks sign-in. Auth badges (“Never signed in” / “Has Auth”) come from <code>list_profile_auth_status</code> when you are signed in as admin.</p>`;
 }
 
 function renderModal() {
   if (modal.kind === 'invite') {
     const password = modal.password || '';
-    const body = accessEmailBody(modal.email, password || '(ask your admin for the temporary password)');
+    const tempPw = password || '(ask your admin for the temporary password)';
+    const appUrl = inviteLink();
+    const copyText = accessEmailCopyText(modal.email, tempPw, appUrl);
     const methodNote = modal.method === 'edge'
       ? 'Auth user created via Edge Function (email confirmed).'
       : modal.method === 'signup'
@@ -556,7 +566,7 @@ function renderModal() {
     const confirmNote = modal.needsConfirm
       ? '<div class="warnbox" role="status"><b>Email confirmation may be required</b><p>If they cannot sign in, turn off Confirm email in Supabase Auth, or deploy the Edge Function (auto-confirms).</p></div>'
       : '';
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ACCESS READY</div><h2>Email their temporary password</h2><p class="dialoglead">Profile and Auth account are ready. Send the temporary password now — they must change it on first sign-in.</p><div class="requestnote"><span>EMAIL</span><p>${escapeHtml(modal.email)}</p><span>TEMPORARY PASSWORD</span><p><code>${escapeHtml(password)}</code></p><span>APP LINK</span><p>${escapeHtml(inviteLink())}</p></div>${confirmNote}${methodNote ? `<p class="quiet">${escapeHtml(methodNote)}</p>` : ''}<div class="dialogactions"><button class="secondary" data-copy-invite="${encodeURIComponent(body)}">Copy email</button><a class="primary mailbutton" href="mailto:${encodeURIComponent(modal.email)}?subject=${encodeURIComponent('Your Team Leave access')}&body=${encodeURIComponent(body)}">Open email</a><button class="primary" data-action="close">Done</button></div></div></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ACCESS READY</div><h2>Email their temporary password</h2><p class="dialoglead">Profile and Auth account are ready. Send the temporary password now — they must change it on first sign-in.</p><div class="requestnote"><span>EMAIL</span><p>${escapeHtml(modal.email)}</p><span>TEMPORARY PASSWORD</span><p><code>${escapeHtml(password)}</code></p><span>APP LINK</span><p>${escapeHtml(appUrl)}</p><span>SUBJECT</span><p>${escapeHtml(ACCESS_EMAIL_SUBJECT)}</p></div>${confirmNote}${methodNote ? `<p class="quiet">${escapeHtml(methodNote)}</p>` : ''}<div class="dialogactions"><button class="secondary" data-copy-invite="${encodeURIComponent(copyText)}">Copy email</button><a class="primary mailbutton" href="${accessMailtoHref(modal.email, tempPw, appUrl)}">Open email</a><button class="primary" data-action="close">Done</button></div></div></div>`;
   }
   if (modal.kind === 'help') {
     return `<div class="scrim" data-action="close"><div class="dialog dialogwide" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ONBOARDING</div><h2>How Team Leave access works</h2><p class="dialoglead">English checklist for first-time access and password resets.</p>
@@ -731,13 +741,13 @@ app.addEventListener('click', async e => {
     render();
     return;
   }
-  const copy = e.target.closest('[data-copy-invite]'); if (copy) { await navigator.clipboard.writeText(decodeURIComponent(copy.dataset.copyInvite)); toast('Access details copied.'); return; }
+  const copy = e.target.closest('[data-copy-invite]'); if (copy) { await navigator.clipboard.writeText(decodeURIComponent(copy.dataset.copyInvite)); toast('Email subject and body copied.'); return; }
   const openNotice = e.target.closest('[data-open-notice]');
   if (openNotice) {
     const requestId = openNotice.dataset.request;
     const n = notifications.find(x => x.id === openNotice.dataset.openNotice);
     if (n) n.read = true;
-    await supabase.rpc('mark_notifications_read').catch(() => {});
+    await rpcSoft('mark_notifications_read');
     if (requestId) {
       const r = requests.find(x => x.id === requestId);
       if (r) {
@@ -766,7 +776,7 @@ app.addEventListener('click', async e => {
     if (!p?.email) return;
     try {
       const tempPassword = generateTempPassword();
-      await supabase.rpc('set_must_change_password', { p_id: p.id, p_value: true }).catch(() => {});
+      await rpcSoft('set_must_change_password', { p_id: p.id, p_value: true });
       const provisioned = await provisionAuthUser(p.email, p.name, tempPassword);
       openModal({
         kind: 'invite',
@@ -988,7 +998,7 @@ app.addEventListener('submit', async e => {
     setError('');
     const {error} = await supabase.auth.updateUser({password});
     if (error) { setError(error.message); return; }
-    await supabase.rpc('clear_must_change_password').catch(() => {});
+    await rpcSoft('clear_must_change_password');
     mustChangePassword = false;
     passwordRecovery = false;
     recoveryError = '';
@@ -1007,7 +1017,7 @@ app.addEventListener('submit', async e => {
     if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; }
     const {error} = await supabase.auth.updateUser({password});
     if (error) { setError(error.message); return; }
-    await supabase.rpc('clear_must_change_password').catch(() => {});
+    await rpcSoft('clear_must_change_password');
     mustChangePassword = false;
     closeModal();
     toast('Password updated.');
