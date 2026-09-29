@@ -7,7 +7,15 @@ import {createClient} from 'https://esm.sh/@supabase/supabase-js@2';
 
 const SUPABASE_URL = 'https://skezxxnhsvdrwrdxabje.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_9t-QgYU94nmDlBy696rKcQ_Z0IkqiqA';
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {auth:{persistSession:true,detectSessionInUrl:true}});
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {auth:{persistSession:true,detectSessionInUrl:true,flowType:'pkce'}});
+
+/** Pages origin path only — must match Supabase Auth Redirect URLs allow list. */
+const appRedirectUrl = () => location.href.split(/[?#]/)[0];
+const urlLooksLikeRecovery = () => /(?:^|[?#&])type=recovery(?:&|$)/i.test(`${location.search}${location.hash}`);
+const scrubAuthParamsFromUrl = () => {
+  if (!location.hash && !/[?&](code|type|access_token|refresh_token|error)=/i.test(location.search)) return;
+  history.replaceState({}, document.title, appRedirectUrl());
+};
 
 let requests = [];
 let notifications = [];
@@ -18,6 +26,8 @@ let loading = true;
 let loadError = '';
 let session = null;
 let authMode = 'signin';
+/** True while the user arrived via a password-reset email link (PASSWORD_RECOVERY). */
+let passwordRecovery = false;
 let role = 'employee', view = 'overview', modal = null;
 let requestFilter = 'all';
 let month = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
@@ -166,9 +176,18 @@ function refreshNoticeBadge() {
 
 async function load() {
   try {
+    if (urlLooksLikeRecovery()) passwordRecovery = true;
     const auth = await supabase.auth.getSession();
     session = auth.data.session;
-    if (session) { await loadState(); startLive(); }
+    if (session && passwordRecovery) {
+      // Keep the recovery session; profile load may fail (deactivated / not invited) — still show set-password.
+      try { await loadState(); loadError = ''; }
+      catch (e) { loadError = e.message; }
+      scrubAuthParamsFromUrl();
+    } else if (session) {
+      await loadState();
+      startLive();
+    }
     loading = false;
     render();
   } catch (e) {
@@ -320,6 +339,10 @@ function renderModal() {
     return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PROFILE READY</div><h2>Invite them to create a password</h2><p class="dialoglead">Their work email is on the team. Share the app link — they create their own password. No temporary password is generated.</p><div class="requestnote"><span>ACCESS LINK</span><p>${escapeHtml(link)}</p><span>EMAIL</span><p>${escapeHtml(modal.email)}</p></div><div class="dialogactions"><button class="secondary" data-copy-invite="${encodeURIComponent(body)}">Copy invite</button><a class="primary mailbutton" href="mailto:${encodeURIComponent(modal.email)}?subject=${encodeURIComponent('Your Team Leave access')}&body=${encodeURIComponent(body)}">Open email</a><button class="primary" data-action="close">Done</button></div></div></div>`;
   }
   if (modal.kind === 'password') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">ACCOUNT SECURITY</div><h2>Change password</h2><p class="dialoglead">Use at least 8 characters. Your current session will stay signed in.</p><form id="passwordform"><label>New password<input name="password" type="password" minlength="8" autocomplete="new-password" required></label><label>Confirm password<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required></label><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Update password</button></div></form></div></div>`;
+  if (modal.kind === 'resetconfirm') {
+    const p = person(modal.id); if (!p) return '';
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">PASSWORD RESET</div><h2>Send reset email?</h2><p class="dialoglead">Supabase will email a one-time link to <b>${escapeHtml(p.email)}</b>. No temporary password is created.</p><div class="requestnote"><span>REQUIREMENT</span><p>They must already have used Create password once. If they were only invited and never set a password, share the app link and ask them to use Create password instead.</p></div><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="backtoedituser">Back</button><button type="button" class="primary" data-action="confirmreset">Send reset email</button></div></div></div>`;
+  }
   if (modal.kind === 'notifications') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">UPDATES</div><h2>Notifications</h2><p class="dialoglead">In-app only — Team Leave does not send email.</p><div class="notificationlist">${notifications.length ? notifications.map(n => `<article class="notification ${n.read ? '' : 'unread'}"><b>${escapeHtml(n.title)}</b><p>${escapeHtml(n.message)}</p><time>${new Date(n.created_at).toLocaleString('en-CA', {dateStyle:'medium', timeStyle:'short'})}</time></article>`).join('') : '<div class="empty">You are all caught up.</div>'}</div></div></div>`;
   if (modal.kind === 'manageholidays') {
     const year = new Date().getFullYear();
@@ -335,8 +358,10 @@ function renderModal() {
   if (modal.kind === 'edituser') {
     const p = person(modal.id); if (!p) return '';
     const resetOk = modal.resetSent
-      ? `<div class="okbox" id="resetfeedback" role="status">Password reset link sent to ${escapeHtml(p.email)}. They can set a new password from the email link (no temporary password).</div>`
-      : `<div id="resetfeedback"></div>`;
+      ? `<div class="okbox" id="resetfeedback" role="status">Password reset link sent to ${escapeHtml(p.email)}. They open the email link, set a new password on the Team Leave page, then sign in. No temporary password.</div>`
+      : modal.resetError
+        ? `<div class="formerror" id="resetfeedback" role="alert">${escapeHtml(modal.resetError)}</div>`
+        : `<div id="resetfeedback"></div>`;
     return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">${escapeHtml(p.email)}</p><form id="edituserform"><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option><option value="admin" ${p.role === 'admin' ? 'selected' : ''}>Admin</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
   }
   if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create their team profile. They will create their own password from the sign-in page.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
@@ -358,9 +383,16 @@ function renderModal() {
 
 function render() {
   if (loading) { app.innerHTML = '<main class="main"><h1>Loading team leave…</h1></main>'; return; }
+  if (passwordRecovery && session) {
+    const notice = loadError
+      ? `<div class="warnbox" role="status"><b>Note</b><p>${escapeHtml(loadError)} You can still set a new password; ask an admin to fix access before signing in again.</p></div>`
+      : '';
+    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PASSWORD RESET</div><h1>Set a new password</h1><p>Choose a new password for ${escapeHtml(session.user?.email || 'your account')}. Use at least 8 characters.</p>${notice}<form id="recoveryform"><label>New password<input name="password" type="password" minlength="8" autocomplete="new-password" required placeholder="At least 8 characters"></label><label>Confirm password<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required placeholder="Repeat your password"></label><div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">Save new password</button></form><button class="loginlink" data-action="cancelrecovery">Cancel and return to sign in</button><p class="loginhelp">This link came from a Team Leave password reset email. After saving, you can sign in with the new password.</p></section></main>`;
+    return;
+  }
   if (!session) {
     const creating = authMode === 'signup', forgot = authMode === 'forgot';
-    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>${forgot ? 'Enter your email to receive a password reset link.' : creating ? 'Create a password for your invited work email.' : 'Sign in with your work email and password.'}</p>${forgot ? '' : `<div class="authtabs" role="tablist" aria-label="Account access"><button type="button" role="tab" aria-selected="${!creating}" class="${!creating ? 'active' : ''}" data-auth-mode="signin">Sign in</button><button type="button" role="tab" aria-selected="${creating}" class="${creating ? 'active' : ''}" data-auth-mode="signup">Create password</button></div>`}<form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com"></label>${forgot ? '' : `<label>Password<input name="password" type="password" autocomplete="${creating ? 'new-password' : 'current-password'}" minlength="8" required placeholder="At least 8 characters"></label>${creating ? '<label>Confirm password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="Repeat your password"></label>' : ''}`}<div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">${forgot ? 'Send reset link' : creating ? 'Create password' : 'Sign in'}</button></form>${forgot ? '<button class="loginlink" data-auth-mode="signin">← Back to sign in</button>' : '<button class="loginlink" data-auth-mode="forgot">Forgot password?</button>'}<p class="loginhelp">Access is limited to email addresses already added by the team manager. Notifications are in-app only.</p></section></main>`;
+    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PRIVATE TEAM</div><h1>Team Leave</h1><p>${forgot ? 'Enter your work email. If you already created a password, we send a reset link. If you were invited and never set one, use Create password instead.' : creating ? 'Create a password for your invited work email.' : 'Sign in with your work email and password.'}</p>${forgot ? '' : `<div class="authtabs" role="tablist" aria-label="Account access"><button type="button" role="tab" aria-selected="${!creating}" class="${!creating ? 'active' : ''}" data-auth-mode="signin">Sign in</button><button type="button" role="tab" aria-selected="${creating}" class="${creating ? 'active' : ''}" data-auth-mode="signup">Create password</button></div>`}<form id="loginform"><label>Email<input name="email" type="email" autocomplete="email" required placeholder="you@company.com"></label>${forgot ? '' : `<label>Password<input name="password" type="password" autocomplete="${creating ? 'new-password' : 'current-password'}" minlength="8" required placeholder="At least 8 characters"></label>${creating ? '<label>Confirm password<input name="confirmPassword" type="password" autocomplete="new-password" minlength="8" required placeholder="Repeat your password"></label>' : ''}`}<div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">${forgot ? 'Send reset link' : creating ? 'Create password' : 'Sign in'}</button></form>${forgot ? '<button class="loginlink" data-auth-mode="signup">Never created a password? Create password</button><button class="loginlink" data-auth-mode="signin">← Back to sign in</button>' : '<button class="loginlink" data-auth-mode="forgot">Forgot password?</button>'}<p class="loginhelp">Access is limited to email addresses already added by the team. Deactivated accounts cannot sign in. Notifications are in-app only.</p></section></main>`;
     return;
   }
   if (loadError) { app.innerHTML = `<main class="loginpage"><section class="logincard"><h1>Unable to open Team Leave</h1><p>${escapeHtml(loadError)}</p><button class="primary" data-action="signout">Return to sign in</button></section></main>`; return; }
@@ -408,7 +440,27 @@ app.addEventListener('click', async e => {
   const date = e.target.closest('[data-date]'); if (date) { selectedDay = date.dataset.date; month = new Date(parseDate(selectedDay).getFullYear(), parseDate(selectedDay).getMonth(), 1); render(); return; }
   const button = e.target.closest('[data-action]'); if (!button) return;
   if (button.dataset.action === 'close') { if (e.target === button || button.tagName === 'BUTTON') closeModal(); return; }
-  if (button.dataset.action === 'signout') { stopLive(); await supabase.auth.signOut(); session = null; render(); return; }
+  if (button.dataset.action === 'signout') {
+    passwordRecovery = false;
+    stopLive();
+    await supabase.auth.signOut();
+    session = null;
+    loadError = '';
+    authMode = 'signin';
+    render();
+    return;
+  }
+  if (button.dataset.action === 'cancelrecovery') {
+    passwordRecovery = false;
+    stopLive();
+    await supabase.auth.signOut();
+    session = null;
+    loadError = '';
+    authMode = 'signin';
+    scrubAuthParamsFromUrl();
+    render();
+    return;
+  }
   if (button.dataset.action === 'new') { openModal({kind:'new'}); return; }
   if (button.dataset.action === 'notifications') {
     openModal({kind:'notifications'});
@@ -445,18 +497,26 @@ app.addEventListener('click', async e => {
     const p = person(modal.id);
     if (!p?.email) { setError('This user has no email on file.'); return; }
     if (p.active === false) { setError('Reactivate the user before sending a password reset link.'); return; }
+    openModal({kind:'resetconfirm', id: modal.id});
+    return;
+  }
+  if (button.dataset.action === 'backtoedituser' && isAdmin() && modal?.kind === 'resetconfirm') {
+    openModal({kind:'edituser', id: modal.id});
+    return;
+  }
+  if (button.dataset.action === 'confirmreset' && isAdmin() && modal?.kind === 'resetconfirm') {
+    const p = person(modal.id);
+    if (!p?.email) { setError('This user has no email on file.'); return; }
+    if (p.active === false) { setError('Reactivate the user before sending a password reset link.'); return; }
     setError('');
     button.disabled = true;
     try {
-      const redirectTo = location.href.split(/[?#]/)[0];
-      const {error} = await supabase.auth.resetPasswordForEmail(p.email, {redirectTo});
+      const {error} = await supabase.auth.resetPasswordForEmail(p.email, {redirectTo: appRedirectUrl()});
       if (error) throw Error(error.message);
-      modal = {...modal, resetSent:true};
-      const box = document.getElementById('resetfeedback');
-      if (box) box.innerHTML = `<div class="okbox" role="status">Password reset link sent to ${escapeHtml(p.email)}. They can set a new password from the email link (no temporary password).</div>`;
+      openModal({kind:'edituser', id: p.id, resetSent: true});
       toast('Password reset email sent.');
     } catch (err) {
-      setError(err.message);
+      openModal({kind:'edituser', id: p.id, resetError: err.message || 'Could not send reset email. Check Auth redirect URLs in Supabase.'});
     } finally {
       button.disabled = false;
     }
@@ -477,7 +537,18 @@ app.addEventListener('change', e => {
 app.addEventListener('submit', async e => {
   if (e.target.id === 'loginform') {
     e.preventDefault(); const f = e.target, email = f.elements.email.value.trim().toLowerCase(); setError('');
-    if (authMode === 'forgot') { const {error} = await supabase.auth.resetPasswordForEmail(email, {redirectTo: location.href.split(/[?#]/)[0]}); if (error) setError(error.message); else f.innerHTML = '<div class="okbox">If this email has an account, a password reset link has been sent.</div>'; return; }
+    if (authMode === 'forgot') {
+      const {data:invited, error:inviteError} = await supabase.rpc('is_invited_email', {p_email:email});
+      if (inviteError) { setError(formatRpcError(inviteError.message)); return; }
+      if (!invited) {
+        setError('This email is not an active team member. Ask an admin to add (or reactivate) you. If you were just invited, use Create password — not Forgot password.');
+        return;
+      }
+      const {error} = await supabase.auth.resetPasswordForEmail(email, {redirectTo: appRedirectUrl()});
+      if (error) { setError(error.message); return; }
+      f.innerHTML = `<div class="okbox" role="status"><b>Check your email</b><p>If this address already has a Team Leave password, a reset link is on its way (check spam). Open the link to set a new password on this site.</p><p>Never created a password? Use <button type="button" class="loginlink inline" data-auth-mode="signup">Create password</button> instead — reset only works after the first password exists.</p></div>`;
+      return;
+    }
     const password = f.elements.password.value;
     if (authMode === 'signup') {
       if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; }
@@ -488,9 +559,25 @@ app.addEventListener('submit', async e => {
     const result = authMode === 'signup' ? await supabase.auth.signUp({email, password}) : await supabase.auth.signInWithPassword({email, password});
     if (result.error) { setError(result.error.message); return; }
     if (authMode === 'signup' && !result.data.session) { f.innerHTML = '<div class="okbox">Password created. If email confirmation is enabled, check your inbox before signing in.</div>'; return; }
-    session = result.data.session; loadError = '';
+    session = result.data.session; loadError = ''; passwordRecovery = false;
     if (session) { try { await loadState(); startLive(); } catch (err) { loadError = err.message; } }
     render(); return;
+  }
+  if (e.target.id === 'recoveryform') {
+    e.preventDefault();
+    const f = e.target, password = f.elements.password.value;
+    if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; }
+    setError('');
+    const {error} = await supabase.auth.updateUser({password});
+    if (error) { setError(error.message); return; }
+    passwordRecovery = false;
+    scrubAuthParamsFromUrl();
+    loadError = '';
+    try { await loadState(); startLive(); }
+    catch (err) { loadError = err.message; }
+    render();
+    if (!loadError) toast('Password updated. You are signed in.');
+    return;
   }
   if (e.target.id === 'passwordform') { e.preventDefault(); const f = e.target, password = f.elements.password.value; if (password !== f.elements.confirmPassword.value) { setError('Passwords do not match.'); return; } const {error} = await supabase.auth.updateUser({password}); if (error) setError(error.message); else { closeModal(); toast('Password updated.'); } return; }
   if (e.target.id === 'edituserform') {
@@ -540,13 +627,27 @@ app.addEventListener('submit', async e => {
   }
 });
 
-document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal) closeModal(); });
+document.addEventListener('keydown', e => { if (e.key === 'Escape' && modal && !passwordRecovery) closeModal(); });
 load();
 supabase.auth.onAuthStateChange(async (event, next) => {
-  if (next?.access_token === session?.access_token && event !== 'PASSWORD_RECOVERY') return;
+  if (event === 'PASSWORD_RECOVERY') {
+    passwordRecovery = true;
+    modal = null;
+    session = next;
+    loadError = '';
+    if (session) {
+      try { await loadState(); loadError = ''; }
+      catch (e) { loadError = e.message; }
+    }
+    scrubAuthParamsFromUrl();
+    loading = false;
+    render();
+    return;
+  }
+  if (next?.access_token === session?.access_token) return;
   session = next; loadError = '';
-  if (session) { try { await loadState(); startLive(); } catch (e) { loadError = e.message; } }
-  else stopLive();
-  if (event === 'PASSWORD_RECOVERY') modal = {kind:'password'};
+  if (!session) passwordRecovery = false;
+  if (session && !passwordRecovery) { try { await loadState(); startLive(); } catch (e) { loadError = e.message; } }
+  else if (!session) stopLive();
   render();
 });

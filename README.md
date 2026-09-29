@@ -14,11 +14,16 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
 2. In **SQL Editor**, run in order:
    1. `supabase/schema.sql` — full current schema.
    2. `supabase/seed_ontario_holidays.sql` — Ontario ESA holidays 2026–2028 (or use **Load Ontario holidays** in Reports after login).
-3. **Authentication → URL configuration**
-   - Site URL: your GitHub Pages URL (e.g. `https://<org>.github.io/Team-Leave/`).
-   - Redirect URLs: add that same Pages URL (with and without trailing slash if you use both).
-4. Confirm the publishable key and project URL in `src/app.mjs` (then rebuild) match this project.
-5. Push to `main`; GitHub Actions runs verify checks, then deploys `dist/` to Pages.
+3. **Authentication → URL configuration** (required for Create password + password reset emails)
+   - **Site URL:** `https://omenada2025.github.io/Team-Leave/`
+   - **Redirect URLs** — add all of these (exact match; include trailing slash variants):
+     - `https://omenada2025.github.io/Team-Leave/`
+     - `https://omenada2025.github.io/Team-Leave`
+     - `https://omenada2025.github.io/Team-Leave/index.html`
+   - Dashboard path: Project **skezxxnhsvdrwrdxabje** → **Authentication** → **URL Configuration**.
+4. **Authentication → Email Templates → Reset password** — keep the default link that uses `{{ .ConfirmationURL }}` (do not replace with a custom URL that omits the token).
+5. Confirm the publishable key and project URL in `src/app.mjs` (then rebuild) match this project.
+6. Push to `main`; GitHub Actions runs verify checks, then deploys `dist/` to Pages.
 
 ### Existing Supabase project (already deployed)
 
@@ -50,6 +55,7 @@ These cannot be done from the repo alone:
 1. **Run `upgrade_workflow.sql`** (preferred) **or** at minimum `hotfix_live_rpcs.sql` so Create password + Users Save work — then holiday seed if needed.
 2. **Audit `profiles.used`** after the balance policy: if `used` already included approved Vacation, reset carry-in so balances are not double-counted (`available = allowance − used − approved Vacation`).
 3. Optionally enable **Realtime** for `leave_requests` and `notifications` in the Supabase dashboard (the app also polls every ~45s as a fallback).
+4. **Auth URL configuration** (cannot be set from this repo): Site URL + Redirect URLs must include `https://omenada2025.github.io/Team-Leave/` (see Operator setup). Without this, reset emails open Supabase’s default site or fail redirect, and the Set new password screen never appears.
 
 ## Leave balance rules
 
@@ -61,7 +67,7 @@ These cannot be done from the repo alone:
 
 ## Manager team scope
 
-Managers only **see pending/decide** requests for people on the **same `team`** or whose **`manager_email`** matches the manager’s email. Approved absences remain visible on the shared calendar. There is no separate `admin` role.
+Managers only **see pending/decide** requests for people on the **same `team`** or whose **`manager_email`** matches the manager’s email. Approved absences remain visible on the shared calendar. Profiles with `role = 'admin'` can also decide anyone’s leave and open the Users directory.
 
 ## Notifications
 
@@ -94,10 +100,13 @@ Reports → **Manage holidays**: add / edit / delete, or **Load Ontario** for th
 
 ## Auth notes
 
-- Sign-in: email + password for active team profiles.
-- Create password: only after a manager added (and activated) the profile.
-- Forgot password / **Edit user → Reset password** (admin only): Supabase `resetPasswordForEmail` (no temporary passwords). Redirect must be allow-listed to the Pages URL.
-- Admin Reset password sends the link to that user’s profile email; success/error feedback stays in the Edit user modal.
+- **Sign-in:** email + password for active team profiles.
+- **Create password:** only after an admin added (and activated) the profile. Use this for first-time access — not Forgot password.
+- **Forgot password?** (auth screen): checks the email is an active team member, then calls `resetPasswordForEmail`. Reset only works if that person already created a password once.
+- **Admin Reset password** (Users → Edit user): confirmation step, then email to the profile address; success / failure shown back on Edit user. Disabled while the user is deactivated.
+- **Email link → Set new password:** the app detects Supabase `PASSWORD_RECOVERY` (and `type=recovery` in the URL), shows a dedicated full-page form, then `updateUser({ password })`. Closing/cancel signs out back to Sign in.
+- **Redirect:** both Forgot and admin Reset pass `redirectTo` = the current Pages path (no query/hash). That URL **must** be allow-listed under Authentication → URL Configuration (see Operator setup). Wrong Site URL / missing Redirect URL is the usual reason “email arrives but the link doesn’t let me set a password.”
+- Deactivated / not-on-team accounts get plain-language errors; recovery still allows setting a password, with a note that an admin must reactivate before sign-in works.
 
 ## What managers enforce in SQL
 
