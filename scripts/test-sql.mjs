@@ -28,10 +28,16 @@ for (const [label, sql] of [['schema', schema], ['upgrade', upgrade]]) {
   assert(`${label}: rollover_leave_year`, /create or replace function public\.rollover_leave_year/i.test(sql));
   assert(`${label}: team_settings`, /create table if not exists public\.team_settings/i.test(sql));
   assert(`${label}: profiles.active`, /active boolean not null default true/i.test(sql) || /add column if not exists active/i.test(sql));
+  assert(`${label}: upsert_profile p_active`, /p_active boolean default true/i.test(sql));
 }
 
 assert('upgrade drops email_events', /drop table if exists public\.email_events/i.test(upgrade));
 assert('schema drops email_events', /drop table if exists public\.email_events/i.test(schema));
+assert('upgrade reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.test(upgrade));
+
+const hotfix = readFileSync(join(dir, 'hotfix_upsert_profile.sql'), 'utf8');
+assert('hotfix has upsert_profile p_active', /p_active boolean default true/i.test(hotfix));
+assert('hotfix reloads PostgREST cache', /notify pgrst,\s*'reload schema'/i.test(hotfix));
 
 const seed = readFileSync(join(dir, 'seed_ontario_holidays.sql'), 'utf8');
 assert('seed has 2027', /2027-01-01/.test(seed));

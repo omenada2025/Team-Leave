@@ -1,9 +1,13 @@
 -- Team Leave — upgrade for existing Supabase projects.
--- Idempotent. Run once in the SQL editor after deploying this branch.
+-- Idempotent. Safe to re-run in the SQL editor after deploying this branch.
 -- Then seed holidays if needed (seed_ontario_holidays.sql or in-app Load Ontario holidays).
 --
 -- Adds / restores: team-scoped managers, configurable coverage, soft-deactivate,
--- holiday delete, year rollover (carry-over = 0), drops unused email_events.
+-- holiday delete, year rollover (carry-over = 0), drops unused email_events,
+-- upsert_profile(... p_active) matching the Pages client RPC args.
+--
+-- If Edit user → Save fails with "Could not find ... upsert_profile(...p_active...)",
+-- prefer this full upgrade. For a Save-only emergency paste, see hotfix_upsert_profile.sql.
 
 alter table public.profiles add column if not exists team text not null default 'General';
 alter table public.profiles add column if not exists manager_email text;
@@ -207,8 +211,10 @@ drop policy if exists team_settings_read on public.team_settings;
 create policy team_settings_read on public.team_settings
   for select to authenticated using (current_profile_id() is not null);
 
+-- Drop every known overload so PostgREST only exposes the current signature.
 drop function if exists public.upsert_profile(text,text,integer,integer,text,uuid);
 drop function if exists public.upsert_profile(text,text,integer,integer,text,uuid,text,text);
+drop function if exists public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean);
 create or replace function public.upsert_profile(
   p_email text default null,
   p_name text default null,
@@ -523,3 +529,6 @@ grant execute on function public.delete_holiday(date) to authenticated;
 grant select on public.holidays to authenticated;
 grant select on public.team_settings to authenticated;
 grant select, update on public.notifications to authenticated;
+
+-- Make new/replaced RPCs visible to the API immediately (avoids stale schema-cache 404s).
+notify pgrst, 'reload schema';

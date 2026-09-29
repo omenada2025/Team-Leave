@@ -22,7 +22,8 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
 
 ### Existing Supabase project (already deployed)
 
-1. In **SQL Editor**, run `supabase/upgrade_workflow.sql` (idempotent). This adds:
+1. In **SQL Editor**, run `supabase/upgrade_workflow.sql` (idempotent; ends with `notify pgrst, 'reload schema'`). This adds:
+   - `upsert_profile(..., p_active)` matching Edit user → Save
    - Team-scoped `decide_leave` / RLS (`manages_person`)
    - Configurable `team_settings.minimum_coverage`
    - Soft-deactivate (`profiles.active`)
@@ -35,11 +36,13 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
 
 Do **not** run `supabase/add_work_from_home.sql` — it is obsolete.
 
+**Save-only emergency:** If Edit user → Save fails with `Could not find the function public.upsert_profile(...p_active...)` and you cannot run the full upgrade yet, paste `supabase/hotfix_upsert_profile.sql` in the SQL Editor. Still run the full `upgrade_workflow.sql` soon for the rest of the RPCs.
+
 ### SQL / ops Daniela must still do on live Supabase
 
 These cannot be done from the repo alone:
 
-1. **Run `upgrade_workflow.sql`** (then holiday seed if needed) before relying on the new UI.
+1. **Run `upgrade_workflow.sql`** (preferred) **or** at minimum `hotfix_upsert_profile.sql` so Save works — then holiday seed if needed.
 2. **Audit `profiles.used`** after the balance policy: if `used` already included approved Vacation, reset carry-in so balances are not double-counted (`available = allowance − used − approved Vacation`).
 3. Optionally enable **Realtime** for `leave_requests` and `notifications` in the Supabase dashboard (the app also polls every ~45s as a fallback).
 
@@ -78,7 +81,8 @@ Reports → **Manage holidays**: add / edit / delete, or **Load Ontario** for th
 
 - Sign-in: email + password for active team profiles.
 - Create password: only after a manager added (and activated) the profile.
-- Forgot password: Supabase reset email (redirect must be allow-listed).
+- Forgot password / **Edit user → Reset password**: Supabase `resetPasswordForEmail` (no temporary passwords). Redirect must be allow-listed to the Pages URL.
+- Manager Reset password sends the link to that user’s profile email; success/error feedback stays in the Edit user modal.
 
 ## What managers enforce in SQL
 
@@ -105,7 +109,8 @@ node scripts/test-sql.mjs
 | `src/` | Editable SPA source |
 | `dist/` | Built copy deployed to Pages |
 | `supabase/schema.sql` | Greenfield install |
-| `supabase/upgrade_workflow.sql` | Existing-project upgrade |
+| `supabase/upgrade_workflow.sql` | Existing-project upgrade (preferred) |
+| `supabase/hotfix_upsert_profile.sql` | Minimal Save-error paste for live |
 | `supabase/seed_ontario_holidays.sql` | Holiday seed 2026–2028 |
 | `.github/workflows/ci.yml` | PR/main logic + SQL checks |
 | `.github/workflows/pages.yml` | Verify then deploy Pages |

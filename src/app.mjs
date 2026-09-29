@@ -319,7 +319,10 @@ function renderModal() {
   }
   if (modal.kind === 'edituser') {
     const p = person(modal.id); if (!p) return '';
-    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">${escapeHtml(p.email)}</p><form id="edituserform"><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p><div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
+    const resetOk = modal.resetSent
+      ? `<div class="okbox" id="resetfeedback" role="status">Password reset link sent to ${escapeHtml(p.email)}. They can set a new password from the email link (no temporary password).</div>`
+      : `<div id="resetfeedback"></div>`;
+    return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">USER DETAILS</div><h2 id="dialog-title">Edit ${escapeHtml(p.name)}</h2><p class="dialoglead">${escapeHtml(p.email)}</p><form id="edituserform"><label>Name<input name="name" maxlength="100" value="${escapeHtml(p.name)}" required></label><div class="formrow"><label>Team<input name="team" maxlength="80" value="${escapeHtml(p.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(p.manager_email || '')}"></label></div><div class="formrow"><label>Annual allowance<input name="allowance" type="number" min="0" max="100" value="${p.allowance}" required></label><label>Carry-in / adjustment<input name="used" type="number" min="0" max="100" value="${p.used}" required></label></div><label>Role<select name="role"><option value="employee" ${p.role === 'employee' ? 'selected' : ''}>Employee</option><option value="manager" ${p.role === 'manager' ? 'selected' : ''}>Manager</option></select></label><label class="checkline"><input type="checkbox" name="active" ${p.active !== false ? 'checked' : ''}> Active (uncheck to deactivate without deleting history)</label><p class="quiet">Carry-in is manual only — approved Vacation requests are counted separately. Available = allowance − carry-in − approved Vacation. Carry-over into a new year defaults to 0.</p>${resetOk}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button class="secondary" type="button" data-action="resetpassword" ${p.active === false ? 'disabled title="Reactivate the user before sending a reset link"' : ''}>Reset password</button><button class="secondary" type="button" data-action="close">Cancel</button><button class="primary" type="submit">Save changes</button></div></form></div></div>`;
   }
   if (modal.kind === 'adduser') return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">NEW USER</div><h2 id="dialog-title">Add user</h2><p class="dialoglead">Create their team profile. They will create their own password from the sign-in page.</p><form id="teamform"><label>Name<input name="name" maxlength="100" required></label><label>Email<input name="email" type="email" required></label><div class="formrow"><label>Team<input name="team" value="${escapeHtml(mine()?.team || 'General')}" required></label><label>Manager email<input name="managerEmail" type="email" value="${escapeHtml(mine()?.email || '')}"></label></div><label>Annual vacation days<input name="allowance" type="number" min="0" max="100" value="25" required></label><div id="formerror" role="alert" class="formerror"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button class="primary" type="submit">Add to team</button></div></form></div></div>`;
   if (modal.kind === 'new' || modal.kind === 'editrequest') {
@@ -422,6 +425,27 @@ app.addEventListener('click', async e => {
   }
   if (button.dataset.action === 'queue') { view = 'requests'; render(); return; }
   if (button.dataset.action === 'adduser' && role === 'manager') { openModal({kind:'adduser'}); return; }
+  if (button.dataset.action === 'resetpassword' && role === 'manager' && modal?.kind === 'edituser') {
+    const p = person(modal.id);
+    if (!p?.email) { setError('This user has no email on file.'); return; }
+    if (p.active === false) { setError('Reactivate the user before sending a password reset link.'); return; }
+    setError('');
+    button.disabled = true;
+    try {
+      const redirectTo = location.href.split(/[?#]/)[0];
+      const {error} = await supabase.auth.resetPasswordForEmail(p.email, {redirectTo});
+      if (error) throw Error(error.message);
+      modal = {...modal, resetSent:true};
+      const box = document.getElementById('resetfeedback');
+      if (box) box.innerHTML = `<div class="okbox" role="status">Password reset link sent to ${escapeHtml(p.email)}. They can set a new password from the email link (no temporary password).</div>`;
+      toast('Password reset email sent.');
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      button.disabled = false;
+    }
+    return;
+  }
   if (button.dataset.action === 'password') { openModal({kind:'password'}); return; }
   if (button.dataset.action === 'prevmonth' || button.dataset.action === 'nextmonth') { month = new Date(month.getFullYear(), month.getMonth() + (button.dataset.action === 'prevmonth' ? -1 : 1), 1); selectedDay = iso(month); render(); return; }
   if (button.dataset.action === 'today') { month = new Date(new Date().getFullYear(), new Date().getMonth(), 1); selectedDay = iso(new Date()); render(); }
