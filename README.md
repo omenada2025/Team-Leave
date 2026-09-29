@@ -24,7 +24,7 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
      - `https://omenada2025.github.io/Team-Leave/index.html`
      - `https://omenada2025.github.io/Team-Leave/?reset=1`
    - Wrong Site URL is the usual reason a reset email opens Sign in **without** tokens.
-4. **Authentication → Email Templates → Reset password** — use the default `{{ .ConfirmationURL }}` link (do not replace with a bare Pages URL that omits the token).
+4. **Authentication → Email Templates** — paste Team Leave subjects + HTML from [`docs/email-templates/`](docs/email-templates/README.md) (at least **Reset password**: `Team Leave — Reset your password`). Keep `{{ .ConfirmationURL }}` (do not replace with a bare Pages URL that omits the token). Optional Custom SMTP sender name: **Team Leave**.
 5. **Deploy Edge Function `admin-create-user`** (recommended) and set secret `SUPABASE_SERVICE_ROLE_KEY` — see `docs/ops-checklist.md`. Without it, Add user uses a client signUp fallback + mailto; turn **Confirm email** off if using that fallback.
 6. Confirm the publishable key and project URL in `src/app.mjs` (then rebuild) match this project.
 7. Push to `main`; GitHub Actions runs verify checks, then deploys `dist/` to Pages.

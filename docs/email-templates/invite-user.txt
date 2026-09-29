@@ -1,0 +1,14 @@
+Team Leave — You're invited
+
+An admin invited you to Team Leave, the private team leave calendar at
+https://omenada2025.github.io/Team-Leave/.
+
+Accept the invite and set your password with this link
+(opens a secure Supabase page, then returns you to Team Leave):
+
+{{ .ConfirmationURL }}
+
+If you were not expecting an invite, you can ignore this email or tell your admin.
+
+— Team Leave · Daniela’s team (Zenatech)
+App: {{ .SiteURL }}
