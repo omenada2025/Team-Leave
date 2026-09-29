@@ -15,13 +15,16 @@ Editable source lives in `src/`. Run `bash scripts/build.sh` to copy into `dist/
    1. `supabase/schema.sql` — full current schema.
    2. `supabase/seed_ontario_holidays.sql` — Ontario ESA holidays 2026–2028 (or use **Load Ontario holidays** in Reports after login).
 3. **Authentication → URL configuration** (required for Create password + password reset emails)
-   - **Site URL:** `https://omenada2025.github.io/Team-Leave/`
-   - **Redirect URLs** — add all of these (exact match; include trailing slash variants):
+   - Dashboard: Project **skezxxnhsvdrwrdxabje** → **Authentication** → **URL Configuration**.
+   - **Site URL:** `https://omenada2025.github.io/Team-Leave/` (trailing slash required).
+   - **Redirect URLs** — add:
+     - `https://omenada2025.github.io/Team-Leave/**` (wildcard — covers `?reset=1` and path variants)
      - `https://omenada2025.github.io/Team-Leave/`
      - `https://omenada2025.github.io/Team-Leave`
      - `https://omenada2025.github.io/Team-Leave/index.html`
-   - Dashboard path: Project **skezxxnhsvdrwrdxabje** → **Authentication** → **URL Configuration**.
-4. **Authentication → Email Templates → Reset password** — keep the default link that uses `{{ .ConfirmationURL }}` (do not replace with a custom URL that omits the token).
+     - `https://omenada2025.github.io/Team-Leave/?reset=1`
+   - Wrong Site URL is the usual reason a reset email opens Sign in **without** tokens.
+4. **Authentication → Email Templates → Reset password** — use the default `{{ .ConfirmationURL }}` link (do not replace with a bare Pages URL that omits the token).
 5. Confirm the publishable key and project URL in `src/app.mjs` (then rebuild) match this project.
 6. Push to `main`; GitHub Actions runs verify checks, then deploys `dist/` to Pages.
 
@@ -104,8 +107,8 @@ Reports → **Manage holidays**: add / edit / delete, or **Load Ontario** for th
 - **Create password:** only after an admin added (and activated) the profile. Use this for first-time access — not Forgot password.
 - **Forgot password?** (auth screen): checks the email is an active team member, then calls `resetPasswordForEmail`. Reset only works if that person already created a password once.
 - **Admin Reset password** (Users → Edit user): confirmation step, then email to the profile address; success / failure shown back on Edit user. Disabled while the user is deactivated.
-- **Email link → Set new password:** the app detects Supabase `PASSWORD_RECOVERY` (and `type=recovery` in the URL), shows a dedicated full-page form, then `updateUser({ password })`. Closing/cancel signs out back to Sign in.
-- **Redirect:** both Forgot and admin Reset pass `redirectTo` = the current Pages path (no query/hash). That URL **must** be allow-listed under Authentication → URL Configuration (see Operator setup). Wrong Site URL / missing Redirect URL is the usual reason “email arrives but the link doesn’t let me set a password.”
+- **Email link → Set new password:** the client uses **implicit** Auth flow (not PKCE) so admin-sent reset emails work on the employee’s device. On load it parses `#access_token` / `type=recovery`, `?code=`, or `token_hash`, calls `setSession` / `verifyOtp`, and **always** shows the Set new password screen when `?reset=1` or recovery intent is present — never the Sign in form.
+- **Redirect:** Forgot and admin Reset pass `redirectTo` = `https://…/Team-Leave/?reset=1`. Allow-list that URL (and the `/**` wildcard) under Authentication → URL Configuration.
 - Deactivated / not-on-team accounts get plain-language errors; recovery still allows setting a password, with a note that an admin must reactivate before sign-in works.
 
 ## What managers enforce in SQL
@@ -123,6 +126,7 @@ Reports → **Manage holidays**: add / edit / delete, or **Load Ontario** for th
 ```bash
 bash scripts/build.sh
 node scripts/test-logic.mjs
+node scripts/test-auth-url.mjs
 node scripts/test-sql.mjs
 ```
 

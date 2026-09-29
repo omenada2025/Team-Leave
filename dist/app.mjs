@@ -3,19 +3,19 @@ import {
   businessDays, requestDuration, balanceDuration, setTeam, setHolidays, remaining, coverageFor,
   validateRequest, managesPerson, ontarioHolidays, activePeople
 } from './logic.mjs';
+import {
+  appRedirectUrl, parseAuthUrl, scrubAuthParamsFromUrl, markRecoveryIntent,
+  clearRecoveryIntent, hasRecoveryIntent
+} from './auth-url.mjs';
 import {createClient} from 'https://esm.sh/@supabase/supabase-js@2';
 
 const SUPABASE_URL = 'https://skezxxnhsvdrwrdxabje.supabase.co';
 const SUPABASE_KEY = 'sb_publishable_9t-QgYU94nmDlBy696rKcQ_Z0IkqiqA';
-const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {auth:{persistSession:true,detectSessionInUrl:true,flowType:'pkce'}});
-
-/** Pages origin path only — must match Supabase Auth Redirect URLs allow list. */
-const appRedirectUrl = () => location.href.split(/[?#]/)[0];
-const urlLooksLikeRecovery = () => /(?:^|[?#&])type=recovery(?:&|$)/i.test(`${location.search}${location.hash}`);
-const scrubAuthParamsFromUrl = () => {
-  if (!location.hash && !/[?&](code|type|access_token|refresh_token|error)=/i.test(location.search)) return;
-  history.replaceState({}, document.title, appRedirectUrl());
-};
+// Implicit flow: recovery email links carry tokens in the hash and work in any browser.
+// PKCE would bind the link to the browser that called resetPasswordForEmail (breaks admin-sent resets).
+const supabase = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: {persistSession: true, detectSessionInUrl: false, flowType: 'implicit'}
+});
 
 let requests = [];
 let notifications = [];
@@ -26,8 +26,9 @@ let loading = true;
 let loadError = '';
 let session = null;
 let authMode = 'signin';
-/** True while the user arrived via a password-reset email link (PASSWORD_RECOVERY). */
+/** True while the user arrived via a password-reset email link. */
 let passwordRecovery = false;
+let recoveryError = '';
 let role = 'employee', view = 'overview', modal = null;
 let requestFilter = 'all';
 let month = new Date(new Date().getFullYear(), new Date().getMonth(), 1);
@@ -174,25 +175,67 @@ function refreshNoticeBadge() {
   } else if (badge) badge.remove();
 }
 
+/** Consume hash/query auth params ourselves so recovery never falls through to Sign in. */
+async function establishSessionFromUrl() {
+  const parsed = parseAuthUrl();
+  if (hasRecoveryIntent()) passwordRecovery = true;
+  if (parsed.error) {
+    recoveryError = parsed.error;
+    return null;
+  }
+
+  if (parsed.token_hash && (parsed.type === 'recovery' || passwordRecovery)) {
+    passwordRecovery = true;
+    const {data, error} = await supabase.auth.verifyOtp({token_hash: parsed.token_hash, type: 'recovery'});
+    if (error) throw Error(error.message);
+    return data.session;
+  }
+
+  if (parsed.access_token && parsed.refresh_token) {
+    if (parsed.type === 'recovery') passwordRecovery = true;
+    const {data, error} = await supabase.auth.setSession({
+      access_token: parsed.access_token,
+      refresh_token: parsed.refresh_token
+    });
+    if (error) throw Error(error.message);
+    return data.session;
+  }
+
+  if (parsed.code) {
+    const {data, error} = await supabase.auth.exchangeCodeForSession(parsed.code);
+    if (error) throw Error(error.message);
+    if (parsed.type === 'recovery' || passwordRecovery) passwordRecovery = true;
+    return data.session;
+  }
+
+  const existing = await supabase.auth.getSession();
+  return existing.data.session;
+}
+
 async function load() {
   try {
-    if (urlLooksLikeRecovery()) passwordRecovery = true;
-    const auth = await supabase.auth.getSession();
-    session = auth.data.session;
+    if (hasRecoveryIntent()) passwordRecovery = true;
+    session = await establishSessionFromUrl();
+    if (parseAuthUrl().hasAuthPayload || parseAuthUrl().looksRecovery) scrubAuthParamsFromUrl();
     if (session && passwordRecovery) {
-      // Keep the recovery session; profile load may fail (deactivated / not invited) — still show set-password.
       try { await loadState(); loadError = ''; }
       catch (e) { loadError = e.message; }
-      scrubAuthParamsFromUrl();
-    } else if (session) {
+    } else if (session && !passwordRecovery) {
       await loadState();
       startLive();
+    } else if (passwordRecovery && !session && !recoveryError) {
+      recoveryError = 'This reset link is missing its login tokens. Request a new password reset email and open it on this device.';
     }
     loading = false;
     render();
   } catch (e) {
     loading = false;
-    loadError = e.message;
+    if (passwordRecovery || hasRecoveryIntent()) {
+      recoveryError = e.message || 'Could not open this password reset link.';
+      passwordRecovery = true;
+    } else {
+      loadError = e.message;
+    }
     render();
   }
 }
@@ -381,13 +424,24 @@ function renderModal() {
   return `<div class="scrim" data-action="close"><div class="dialog" role="dialog" aria-modal="true" aria-labelledby="dialog-title"><button class="dialogclose" data-action="close" aria-label="Close">×</button><div class="eyebrow">MANAGER DECISION</div><h2 id="dialog-title">Review time off</h2><div class="reviewperson">${avatar(person(r.person))}<div><b>${escapeHtml(person(r.person)?.name || '')}</b><span>${typeLabel(r)} · ${range(r)} · ${daysLabel(reviewDays)}</span></div>${badge(r.status)}</div><div class="reviewfacts"><div><span>Balance after approval</span><b>${b.available - burn} days</b></div><div><span>Coverage impact</span><b class="${risk.length ? 'dangertext' : ''}">${risk.length ? `${daysLabel(risk.length)} below minimum` : 'No conflict'}</b></div></div>${risk.length ? `<div class="warnbox"><b>⚠ Coverage conflict</b><p>Approving this request leaves ${risk[0].available} of ${head} people available on ${risk.map(x => pretty(x.date)).join(', ')}. Your minimum is ${minimumCoverage}.</p></div>` : '<div class="okbox">✓ Team coverage meets the minimum for these dates.</div>'}${r.note ? `<div class="requestnote"><span>EMPLOYEE NOTE</span><p>${escapeHtml(r.note)}</p></div>` : ''}<form id="decisionform"><label>Decision note <span class="optional">Required to decline</span><textarea name="decisionNote" maxlength="500" placeholder="Add context for the employee"></textarea></label>${risk.length ? `<label class="checkline"><input type="checkbox" name="override" id="overrideCoverage"> I’ve arranged coverage and want to approve anyway.</label>` : ''}<div id="formerror" class="formerror" role="alert"></div><div class="dialogactions"><button type="button" class="secondary" data-action="close">Cancel</button><button type="submit" name="decision" value="declined" class="declinebutton">Decline</button><button type="submit" name="decision" value="approved" class="primary" ${risk.length ? 'disabled' : ''} id="approveBtn">Approve →</button></div></form></div></div>`;
 }
 
-function render() {
-  if (loading) { app.innerHTML = '<main class="main"><h1>Loading team leave…</h1></main>'; return; }
-  if (passwordRecovery && session) {
+function renderRecovery() {
+  if (session) {
     const notice = loadError
       ? `<div class="warnbox" role="status"><b>Note</b><p>${escapeHtml(loadError)} You can still set a new password; ask an admin to fix access before signing in again.</p></div>`
       : '';
-    app.innerHTML = `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PASSWORD RESET</div><h1>Set a new password</h1><p>Choose a new password for ${escapeHtml(session.user?.email || 'your account')}. Use at least 8 characters.</p>${notice}<form id="recoveryform"><label>New password<input name="password" type="password" minlength="8" autocomplete="new-password" required placeholder="At least 8 characters"></label><label>Confirm password<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required placeholder="Repeat your password"></label><div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">Save new password</button></form><button class="loginlink" data-action="cancelrecovery">Cancel and return to sign in</button><p class="loginhelp">This link came from a Team Leave password reset email. After saving, you can sign in with the new password.</p></section></main>`;
+    return `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PASSWORD RESET</div><h1>Set a new password</h1><p>Choose a new password for ${escapeHtml(session.user?.email || 'your account')}. Use at least 8 characters.</p>${notice}<form id="recoveryform"><label>New password<input name="password" type="password" minlength="8" autocomplete="new-password" required placeholder="At least 8 characters"></label><label>Confirm password<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required placeholder="Repeat your password"></label><div id="formerror" class="formerror" role="alert"></div><button class="primary" type="submit">Save new password</button></form><button class="loginlink" data-action="cancelrecovery">Cancel and return to sign in</button><p class="loginhelp">This link came from a Team Leave password reset email. After saving, you can sign in with the new password.</p></section></main>`;
+  }
+  const detail = recoveryError
+    || 'Open the newest reset link from your email. If it still fails, ask an admin to send Reset password again.';
+  return `<main class="loginpage"><section class="logincard"><span class="brandmark"><b></b><b></b><b></b><b></b></span><div class="eyebrow">PASSWORD RESET</div><h1>Could not open reset link</h1><p>Team Leave needs a valid reset link to let you set a new password. You should not use Sign in with the old password here.</p><div class="warnbox" role="alert"><b>What happened</b><p>${escapeHtml(detail)}</p></div><button class="primary" data-action="cancelrecovery">Back to sign in</button><button class="loginlink" data-auth-mode="forgot">Request a new reset email</button><p class="loginhelp">Tip: use the latest email only. Links expire. Admin-sent resets open on any device after this fix.</p></section></main>`;
+}
+
+function render() {
+  if (loading) { app.innerHTML = '<main class="main"><h1>Loading team leave…</h1></main>'; return; }
+  // Never show Sign in / Create password while a recovery link (or intent) is active.
+  if (passwordRecovery || hasRecoveryIntent()) {
+    passwordRecovery = true;
+    app.innerHTML = renderRecovery();
     return;
   }
   if (!session) {
@@ -415,7 +469,20 @@ function exportCsv() { const q = v => `"${String(v ?? '').replaceAll('"', '""')}
 function exportIcs() { const compact = s => s.replaceAll('-', ''), events = requests.filter(r => r.status === 'approved').map(r => { const p = person(r.person), end = compact(iso(addDays(parseDate(r.end), 1))); return `BEGIN:VEVENT\r\nUID:${r.id}@teamleave\r\nDTSTART;VALUE=DATE:${compact(r.start)}\r\nDTEND;VALUE=DATE:${end}\r\nSUMMARY:${p?.name} — ${typeLabel(r)}\r\nEND:VEVENT`; }); download('team-leave-calendar.ics', `BEGIN:VCALENDAR\r\nVERSION:2.0\r\nPRODID:-//Team Leave//EN\r\n${events.join('\r\n')}\r\nEND:VCALENDAR`, 'text/calendar;charset=utf-8'); }
 
 app.addEventListener('click', async e => {
-  const authTab = e.target.closest('[data-auth-mode]'); if (authTab) { authMode = authTab.dataset.authMode; render(); return; }
+  const authTab = e.target.closest('[data-auth-mode]');
+  if (authTab) {
+    authMode = authTab.dataset.authMode;
+    // Leaving a broken recovery link for Forgot / Sign in / Create password.
+    if (passwordRecovery || hasRecoveryIntent()) {
+      passwordRecovery = false;
+      recoveryError = '';
+      clearRecoveryIntent();
+      scrubAuthParamsFromUrl();
+      if (session) { stopLive(); await supabase.auth.signOut(); session = null; }
+    }
+    render();
+    return;
+  }
   const copy = e.target.closest('[data-copy-invite]'); if (copy) { await navigator.clipboard.writeText(decodeURIComponent(copy.dataset.copyInvite)); toast('Access details copied.'); return; }
   const nav = e.target.closest('[data-view]'); if (nav) { if (nav.dataset.view === 'users' && !isAdmin()) { toast('Only admins can manage users.'); return; } view = nav.dataset.view; modal = null; render(); return; }
   const filter = e.target.closest('[data-filter]'); if (filter) { requestFilter = filter.dataset.filter; render(); return; }
@@ -442,6 +509,8 @@ app.addEventListener('click', async e => {
   if (button.dataset.action === 'close') { if (e.target === button || button.tagName === 'BUTTON') closeModal(); return; }
   if (button.dataset.action === 'signout') {
     passwordRecovery = false;
+    recoveryError = '';
+    clearRecoveryIntent();
     stopLive();
     await supabase.auth.signOut();
     session = null;
@@ -452,6 +521,8 @@ app.addEventListener('click', async e => {
   }
   if (button.dataset.action === 'cancelrecovery') {
     passwordRecovery = false;
+    recoveryError = '';
+    clearRecoveryIntent();
     stopLive();
     await supabase.auth.signOut();
     session = null;
@@ -511,6 +582,7 @@ app.addEventListener('click', async e => {
     setError('');
     button.disabled = true;
     try {
+      // Do not markRecoveryIntent here — the employee opens the email on their own device.
       const {error} = await supabase.auth.resetPasswordForEmail(p.email, {redirectTo: appRedirectUrl()});
       if (error) throw Error(error.message);
       openModal({kind:'edituser', id: p.id, resetSent: true});
@@ -544,8 +616,9 @@ app.addEventListener('submit', async e => {
         setError('This email is not an active team member. Ask an admin to add (or reactivate) you. If you were just invited, use Create password — not Forgot password.');
         return;
       }
+      markRecoveryIntent();
       const {error} = await supabase.auth.resetPasswordForEmail(email, {redirectTo: appRedirectUrl()});
-      if (error) { setError(error.message); return; }
+      if (error) { clearRecoveryIntent(); setError(error.message); return; }
       f.innerHTML = `<div class="okbox" role="status"><b>Check your email</b><p>If this address already has a Team Leave password, a reset link is on its way (check spam). Open the link to set a new password on this site.</p><p>Never created a password? Use <button type="button" class="loginlink inline" data-auth-mode="signup">Create password</button> instead — reset only works after the first password exists.</p></div>`;
       return;
     }
@@ -559,7 +632,7 @@ app.addEventListener('submit', async e => {
     const result = authMode === 'signup' ? await supabase.auth.signUp({email, password}) : await supabase.auth.signInWithPassword({email, password});
     if (result.error) { setError(result.error.message); return; }
     if (authMode === 'signup' && !result.data.session) { f.innerHTML = '<div class="okbox">Password created. If email confirmation is enabled, check your inbox before signing in.</div>'; return; }
-    session = result.data.session; loadError = ''; passwordRecovery = false;
+    session = result.data.session; loadError = ''; passwordRecovery = false; recoveryError = ''; clearRecoveryIntent();
     if (session) { try { await loadState(); startLive(); } catch (err) { loadError = err.message; } }
     render(); return;
   }
@@ -571,6 +644,8 @@ app.addEventListener('submit', async e => {
     const {error} = await supabase.auth.updateUser({password});
     if (error) { setError(error.message); return; }
     passwordRecovery = false;
+    recoveryError = '';
+    clearRecoveryIntent();
     scrubAuthParamsFromUrl();
     loadError = '';
     try { await loadState(); startLive(); }
@@ -632,6 +707,7 @@ load();
 supabase.auth.onAuthStateChange(async (event, next) => {
   if (event === 'PASSWORD_RECOVERY') {
     passwordRecovery = true;
+    recoveryError = '';
     modal = null;
     session = next;
     loadError = '';
@@ -644,9 +720,32 @@ supabase.auth.onAuthStateChange(async (event, next) => {
     render();
     return;
   }
+  // Same token — ignore (do NOT clear passwordRecovery on transient null sessions).
   if (next?.access_token === session?.access_token) return;
+  // SIGNED_IN after a reset link: still force set-password UI when intent is present.
+  if (event === 'SIGNED_IN' && next && (passwordRecovery || hasRecoveryIntent() || parseAuthUrl().looksRecovery)) {
+    passwordRecovery = true;
+    session = next;
+    recoveryError = '';
+    loadError = '';
+    try { await loadState(); loadError = ''; } catch (e) { loadError = e.message; }
+    scrubAuthParamsFromUrl();
+    loading = false;
+    render();
+    return;
+  }
+  if (event === 'SIGNED_OUT') {
+    session = null;
+    stopLive();
+    // Keep recovery UI if the URL still says reset (user landed without tokens).
+    if (!hasRecoveryIntent()) {
+      passwordRecovery = false;
+      recoveryError = '';
+    }
+    render();
+    return;
+  }
   session = next; loadError = '';
-  if (!session) passwordRecovery = false;
   if (session && !passwordRecovery) { try { await loadState(); startLive(); } catch (e) { loadError = e.message; } }
   else if (!session) stopLive();
   render();

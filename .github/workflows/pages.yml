@@ -23,6 +23,8 @@ jobs:
         run: bash scripts/build.sh
       - name: Leave balance & coverage logic
         run: node scripts/test-logic.mjs
+      - name: Auth recovery URL helpers
+        run: node scripts/test-auth-url.mjs
       - name: SQL source checks
         run: node scripts/test-sql.mjs
   deploy:
