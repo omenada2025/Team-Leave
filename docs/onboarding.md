@@ -6,7 +6,7 @@ One-page guide for Daniela’s team. Product UI stays in English.
 
 1. **Admin** opens **Users → Add user** (name + email). Role starts as **Employee** — promote later in **Edit**.
 2. The app creates the **profile** and an **Auth user** with a **temporary password**.
-3. Admin uses **Open email** / **Copy email** to send the temporary password (mailto MVP if SMTP is not wired).
+3. When Resend/SendGrid is configured on the Edge Function, they get an automatic email; otherwise the admin uses **Open email** / **Copy** (the UI warns if mail did not send).
 4. Teammate opens the app → **Sign in** with email + temporary password → **must choose a new password** before using the app.
 
 There is no self-serve **Create password** tab.
