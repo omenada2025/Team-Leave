@@ -12,7 +12,7 @@ create table if not exists public.profiles (
   -- Carry-in / manual adjustment only. Do not store sum of approved leave here.
   -- Year-end policy: carry-over = 0 (reset used to 0 via rollover_leave_year).
   used integer not null default 0 check (used between 0 and allowance),
-  role text not null default 'employee' check (role in ('employee','manager')),
+  role text not null default 'employee' check (role in ('employee','manager','admin')),
   team text not null default 'General',
   manager_email text,
   active boolean not null default true
@@ -76,12 +76,18 @@ language sql stable security definer set search_path=public as $$
   select id from profiles where lower(email)=lower(coalesce(auth.jwt()->>'email','')) and active limit 1
 $$;
 
-create or replace function public.is_manager() returns boolean
+create or replace function public.is_admin() returns boolean
 language sql stable security definer set search_path=public as $$
-  select exists(select 1 from profiles where id=current_profile_id() and role='manager' and active)
+  select exists(select 1 from profiles where id=current_profile_id() and role='admin' and active)
 $$;
 
--- True when the current manager owns this employee via team match or manager_email.
+-- Managers and admins can run leave-approval / coverage RPCs.
+create or replace function public.is_manager() returns boolean
+language sql stable security definer set search_path=public as $$
+  select exists(select 1 from profiles where id=current_profile_id() and role in ('manager','admin') and active)
+$$;
+
+-- Admins manage everyone (except self). Managers: same team OR manager_email match.
 -- Never true for self (self-approve is blocked in decide_leave + UI).
 create or replace function public.manages_person(p_person uuid) returns boolean
 language sql stable security definer set search_path=public as $$
@@ -91,11 +97,16 @@ language sql stable security definer set search_path=public as $$
     join profiles them on them.id = p_person
     where me.id = current_profile_id()
       and me.id <> p_person
-      and me.role = 'manager'
       and me.active
       and (
-        them.team = me.team
-        or lower(coalesce(them.manager_email, '')) = lower(me.email)
+        me.role = 'admin'
+        or (
+          me.role = 'manager'
+          and (
+            them.team = me.team
+            or lower(coalesce(them.manager_email, '')) = lower(me.email)
+          )
+        )
       )
   )
 $$;
@@ -243,7 +254,8 @@ create or replace function public.upsert_profile(
 ) returns uuid language plpgsql security definer set search_path=public as $$
 declare v_id uuid;
 begin
-  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if not is_admin() then raise exception 'Admin access required.'; end if;
+  if p_role is not null and p_role not in ('employee','manager','admin') then raise exception 'Invalid role.'; end if;
   if p_id is not null then
     update profiles set
       name = coalesce(p_name, name),
@@ -280,7 +292,7 @@ end $$;
 create or replace function public.set_profile_active(p_id uuid, p_active boolean)
 returns void language plpgsql security definer set search_path=public as $$
 begin
-  if not is_manager() then raise exception 'Manager access required.'; end if;
+  if not is_admin() then raise exception 'Admin access required.'; end if;
   if p_id = current_profile_id() then raise exception 'You cannot deactivate your own account.'; end if;
   update profiles set active = p_active where id = p_id;
   if not found then raise exception 'User not found.'; end if;
@@ -518,6 +530,7 @@ begin
 end $$;
 
 revoke all on function public.is_invited_email(text) from public;
+revoke all on function public.is_admin() from public;
 revoke all on function public.upsert_profile(text,text,integer,integer,text,uuid,text,text,boolean) from public,anon;
 revoke all on function public.set_profile_active(uuid,boolean) from public,anon;
 revoke all on function public.set_minimum_coverage(integer) from public,anon;
@@ -548,5 +561,5 @@ grant select on public.team_settings to authenticated;
 grant select, update on public.notifications to authenticated;
 
 insert into public.profiles(email,name,allowance,used,role,team,active)
-values('rdaniglad@gmail.com','Daniela Omena',25,0,'manager','General',true)
-on conflict(email) do update set name = excluded.name, role = 'manager', active = true;
+values('rdaniglad@gmail.com','Daniela Omena',25,0,'admin','General',true)
+on conflict(email) do update set name = excluded.name, role = 'admin', active = true;
